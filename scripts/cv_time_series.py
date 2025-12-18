@@ -21,12 +21,12 @@ def month_range(df_dates):
 
 
 def build_folds(dates: pd.Series, embargo_days: int = 1, n_val_months: int = 1):
-    \"\"\"Builds purged monthly folds.
+    """Builds purged monthly folds.
 
     Each fold:
     - Train on all data from start up to (val_start - embargo_days).
     - Validate on a single month.
-    \"\"\"
+    """
     months = month_range(dates)
     folds = []
     # Loop from n_val_months to len(months) to ensure there's at least one month for validation
