@@ -44,7 +44,7 @@ def build_folds(dates: pd.Series, embargo_days: int = 1, n_val_months: int = 1):
     return folds
 
 def run_eval(start_date: str, end_date: str, k_per_day: int, thr_exit: float, out_csv: Path, train_end_date_for_filter: str):
-    \"\"\"Runs eval script; passes train_end_date for filtering ranked entries.\"\"\"
+    """Runs eval script; passes train_end_date for filtering ranked entries."""
     cmd = [
         'python3', 'scripts/eval_buy_k3_filtered_exitmodel.py',
         '--start-date', start_date,
