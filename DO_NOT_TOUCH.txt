@@ -1,0 +1,19 @@
+DO NOT TOUCH
+
+Current best setup (as of 2025-12-18)
+- Pipeline: Entry ranker + preentry_mistake_filter -> Exit via exit_timing_model_weighted
+- Key params: K_PER_DAY=3, HOLD_MIN=8, THR_EXIT=0.50, MIN_PROFIT_PCT=0.10, leverage=1.0, peak-stop=disabled
+- Models:
+  * Entry pre-filter: models/preentry_mistake_filter.joblib
+  * Exit timing:     models/exit_timing_model_weighted.joblib
+  * Ranked entries source: data/entry_ranked_outputs/entries_with_best8_pnl.csv
+- Eval script: scripts/eval_buy_k3_filtered_exitmodel.py
+- Outputs: data/entry_ranked_outputs/buy_k3_filtered_exitmodel_trades.csv and ..._daily.csv
+
+Performance snapshot
+- 2024 (baseline): 121 trade-days; mean daily +3.02%; median +1.81%; win rate 88.4%; top day +37.37%; worst −6.31%.
+- 2025 YTD:        53 trade-days; mean daily +1.20%; median +1.51%; win rate 73.6%; top day +17.97%; worst −16.87%.
+
+Notes
+- Entry and exit are not simultaneous: entry chosen first from ranked list (gated by prefilter); exit evaluated minute-by-minute up to HOLD_MIN and triggered on probability/threshold.
+- To re-evaluate, run: python scripts/eval_buy_k3_filtered_exitmodel.py --start-date 2024-01-01 --end-date 2025-12-18 --k-per-day 3 --thr-exit 0.50 --min-profit-pct 0.10
