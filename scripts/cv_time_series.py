@@ -21,24 +21,30 @@ def month_range(df_dates):
 
 
 def build_folds(dates: pd.Series, embargo_days: int = 1, n_val_months: int = 1):
+    \"\"\"Builds purged monthly folds.
+
+    Each fold:
+    - Train on all data from start up to (val_start - embargo_days).
+    - Validate on a single month.
+    \"\"\"
     months = month_range(dates)
     folds = []
+    # Loop from n_val_months to len(months) to ensure there's at least one month for validation
     for i in range(n_val_months, len(months)):
         val_start = months[i]
-        val_end = (months[i] + pd.offsets.MonthEnd(1))
+        val_end = (val_start + pd.offsets.MonthEnd(1)).normalize()  # Ensure end of day
         train_end = val_start - pd.Timedelta(days=embargo_days)
-        train_mask = (dates < train_end)
-        val_mask = (dates >= val_start) & (dates <= val_end)
-        if train_mask.any() and val_mask.any():
-            folds.append({
-                'train_end': str(train_end.date()),
-                'val_start': str(val_start.date()),
-                'val_end': str(val_end.date()),
-            })
+
+        folds.append({
+            'train_start': str(dates.min().date()),
+            'train_end': str(train_end.date()),
+            'val_start': str(val_start.date()),
+            'val_end': str(val_end.date()),
+        })
     return folds
 
-
-def run_eval(start_date: str, end_date: str, k_per_day: int, thr_exit: float, out_csv: Path):
+def run_eval(start_date: str, end_date: str, k_per_day: int, thr_exit: float, out_csv: Path, train_end_date_for_filter: str):
+    \"\"\"Runs eval script; passes train_end_date for filtering ranked entries.\"\"\"
     cmd = [
         'python3', 'scripts/eval_buy_k3_filtered_exitmodel.py',
         '--start-date', start_date,
@@ -46,8 +52,9 @@ def run_eval(start_date: str, end_date: str, k_per_day: int, thr_exit: float, ou
         '--k-per-day', str(k_per_day),
         '--thr-exit', str(thr_exit),
         '--metrics-out', str(out_csv),
+        '--train-end-date-for-filter', train_end_date_for_filter, # Pass train end date
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def main():
@@ -85,7 +92,7 @@ def main():
         for k in k_vals:
             for thr in thr_vals:
                 out_csv = METRICS_DIR / f"cv_{f['val_start']}_{f['val_end']}_k{k}_thr{thr:.2f}.csv"
-                run_eval(f['val_start'], f['val_end'], k, thr, out_csv)
+                run_eval(f['val_start'], f['val_end'], k, thr, out_csv, f['train_end'])
                 m = pd.read_csv(out_csv).iloc[0].to_dict()
                 m.update({'k': k, 'thr_exit': thr, 'fold': f})
                 results.append(m)

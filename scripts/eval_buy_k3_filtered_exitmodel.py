@@ -143,7 +143,8 @@ def main():
     ap.add_argument('--leverage', type=float, default=1.0)
     ap.add_argument('--metrics-out', type=str, default=None)
     ap.add_argument('--allow-holdout', action='store_true', help='Allow evaluation on holdout dates defined in splits file')
-    ap.add_argument('--splits-file', type=str, default='data/splits.json', help='JSON with holdout split definitions {"holdout_start":"YYYY-MM-DD","embargo_days":int}')
+    ap.add_argument('--splits-file', type='str', default='data/splits.json', help='JSON with holdout split definitions {"holdout_start":"YYYY-MM-DD","embargo_days":int}')
+    ap.add_argument('--train-end-date-for-filter', type=str, default=None, help='For CV, filter ranked entries to be <= this date to prevent leakage')
     args = ap.parse_args()
 
     # Optional holdout guard
@@ -168,6 +169,9 @@ def main():
             raise SystemExit(f"Holdout guard: attempting to evaluate on or after {holdout_start.date()} without --allow-holdout")
 
     ranked = pd.read_csv(RANKED_PATH)
+    if args.train_end_date_for_filter:
+        ranked = ranked[pd.to_datetime(ranked['date']) <= pd.to_datetime(args.train_end_date_for_filter)]
+
     ranked = ranked[ranked.get('pred_dir', 1) == 1].copy()
     ranked['timestamp'] = pd.to_datetime(ranked['timestamp'])
     ranked['date'] = pd.to_datetime(ranked['date']).dt.date
