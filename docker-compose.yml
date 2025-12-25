@@ -5,20 +5,20 @@ services:
     image: plus500-autotrader:latest
     restart: unless-stopped
     environment:
-      BINANCE_API_KEY: ${BINANCE_API_KEY}
-      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
-      EMAIL_TO: ${EMAIL_TO}
-      EMAIL_FROM: ${EMAIL_FROM}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      SMTP_USER: ${SMTP_USER}
-      SMTP_PASS: ${SMTP_PASS}
-      SMTP_STARTTLS: ${SMTP_STARTTLS}
-      SMTP_SSL: ${SMTP_SSL}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      EMAIL_TO: ${EMAIL_TO:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-}
+      SMTP_SSL: ${SMTP_SSL:-}
     volumes:
       - ./data/live:/app/data/live
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     healthcheck:
       test: ["CMD", "python3", "scripts/healthcheck.py", "--port", "8000"]
       interval: 30s
@@ -68,7 +68,7 @@ services:
     volumes:
       - ./data/live_dydx:/app/data/live_dydx
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     healthcheck:
       test: ["CMD", "python3", "scripts/healthcheck.py", "--port", "8001"]
       interval: 30s
