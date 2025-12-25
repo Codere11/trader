@@ -40,6 +40,17 @@ class TradeResult:
     exit_price: float
     duration_min: int
     trade_return_pct: float
+    liquidated: bool
+    liquidation_reason: str
+    restart_source: str
+    restart_amount: float
+    bank_delta: float
+    capital_before: float
+    bank_before: float
+    capital_post_trade: float
+    bank_post_trade: float
+    capital_after: float
+    bank_after: float
 
 
 def build_precontext_window(day: pd.DataFrame, ts: pd.Timestamp, window: int = 5) -> dict:
@@ -141,9 +152,17 @@ def main():
     ap.add_argument('--max-rsi', type=float, default=None)
     ap.add_argument('--allow-hours', type=str, default=None)  # comma-separated hours like "10,15"
     ap.add_argument('--leverage', type=float, default=1.0)
+    ap.add_argument('--start-capital', type=float, default=10.0)
     ap.add_argument('--metrics-out', type=str, default=None)
     ap.add_argument('--allow-holdout', action='store_true', help='Allow evaluation on holdout dates defined in splits file')
-    ap.add_argument('--splits-file', type='str', default='data/splits.json', help='JSON with holdout split definitions {"holdout_start":"YYYY-MM-DD","embargo_days":int}')
+    ap.add_argument('--bank-profit-take', type=float, default=0.5, help='Fraction of profit siphoned to bank on profitable trades')
+    ap.add_argument('--restart-bank-frac', type=float, default=0.10, help='Fraction of bank used as restart capital after liquidation (if bank large enough)')
+    ap.add_argument('--bank-restart-min', type=float, default=100.0, help='Only restart from bank if bank balance is above this threshold')
+    ap.add_argument('--synthetic-check', action='store_true', help='Run internal moneyflow sanity checks and exit')
+    ap.add_argument('--debug-moneyflow', type=int, default=0, help='If >0, prints moneyflow details for this many trades')
+    ap.add_argument('--cap-floor', type=float, default=3.0, help='If capital dips below this, count as liquidation')
+    ap.add_argument('--reseed-capital', type=float, default=10.0, help='Capital amount to reseed after liquidation if bank is not used')
+    ap.add_argument('--splits-file', type=str, default='data/splits.json', help='JSON with holdout split definitions {"holdout_start":"YYYY-MM-DD","embargo_days":int}')
     ap.add_argument('--train-end-date-for-filter', type=str, default=None, help='For CV, filter ranked entries to be <= this date to prevent leakage')
     args = ap.parse_args()
 
@@ -202,14 +221,57 @@ def main():
     if args.allow_hours:
         allow_hours = set(int(h) for h in args.allow_hours.split(',') if h.strip())
 
-    capital = 100.0
+    # Synthetic moneyflow check (fast, deterministic)
+    if args.synthetic_check:
+        def run_streak(num_wins: int, start_cap: float, lev: float, win_ret: float) -> tuple:
+            cap = start_cap
+            bank_local = 0.0
+            for _ in range(num_wins):
+                levered = 1.0 + lev * win_ret
+                gross_profit = cap * (levered - 1.0)
+                bank_delta = gross_profit * float(args.bank_profit_take)
+                cap = cap + (gross_profit - bank_delta)
+                bank_local += bank_delta
+            return cap, bank_local, cap + bank_local
+        c,b,t = run_streak(10, float(args.start_capital), float(args.leverage), 0.01)
+        print('[SYNTHETIC] 10 wins @ +1% each, lev=', args.leverage, ' start=', args.start_capital)
+        print('[SYNTHETIC] capital=', c, ' bank=', b, ' total=', t)
+        # liquidation then restart logic (thresholded bank restart)
+        def restart_from(bank_bal: float) -> tuple:
+            if bank_bal > float(args.bank_restart_min):
+                amt = float(args.restart_bank_frac) * bank_bal
+                return amt, bank_bal - amt, 'bank'
+            return float(args.reseed_capital), bank_bal, 'reseed'
+
+        bank2 = 50.0
+        cap2, bank2, src2 = restart_from(bank2)
+        print('[SYNTHETIC] restart when bank=50 ->', src2, 'cap=', cap2, 'bank=', bank2)
+
+        bank3 = 1000.0
+        cap3, bank3, src3 = restart_from(bank3)
+        # then one +1% win
+        levered = 1.0 + float(args.leverage) * 0.01
+        gross_profit = cap3 * (levered - 1.0)
+        bank_delta = gross_profit * float(args.bank_profit_take)
+        cap3 = cap3 + (gross_profit - bank_delta)
+        bank3 += bank_delta
+        print('[SYNTHETIC] restart when bank=1000 ->', src3, 'cap=', cap3, 'bank=', bank3, 'total=', cap3+bank3)
+        raise SystemExit(0)
+
+    capital = float(args.start_capital)
+    bank = 0.0
     trades = []
     last_exit_ts = None
+    total_liquidations = 0
+    daily_bank_records = []  # track end-of-day bank and capital
+
+    debug_left = int(max(0, args.debug_moneyflow))
 
     for d, g in tqdm(ranked.sort_values('timestamp').groupby('date'), desc='Simulating by day'):
         day = base_by_date.get(d)
         if day is None or day.empty:
             continue
+        start_capital_day = capital
         g = g.sort_values('score', ascending=False)
         chosen_entries = []
         last_exit = None
@@ -290,13 +352,63 @@ def main():
             entry_cost = entry_price * (1 + FEE_RATE)
             exit_value = exit_price * (1 - FEE_RATE)
             trade_ret = (exit_value / entry_cost) - 1.0
-            levered = 1.0 + args.leverage * trade_ret
-            liq = False
-            if levered <= 0:
-                levered = 0.0
-                liq = True
-            # Update capital using levered return
-            capital *= levered
+            levered_raw = 1.0 + args.leverage * trade_ret
+            liq_hard = bool(levered_raw <= 0)
+            levered = max(0.0, float(levered_raw))
+
+            cap_before = float(capital)
+            bank_before = float(bank)
+
+            bank_delta = 0.0
+            if liq_hard:
+                # Hard liquidation: equity to zero
+                if debug_left > 0:
+                    print('[MF] LIQUIDATION_HARD at', day.iloc[pos]['timestamp'], 'cap=', capital, 'bank=', bank)
+                capital = 0.0
+            else:
+                if levered > 1.0:
+                    # Profitable: siphon part of the profit to bank
+                    gross_profit = capital * (levered - 1.0)
+                    bank_delta = gross_profit * float(args.bank_profit_take)
+                    keep_profit = gross_profit - bank_delta
+                    if debug_left > 0:
+                        print('[MF] WIN', 'entry=', day.iloc[pos]['timestamp'], 'lev_ret=', levered-1.0, 'gross=', gross_profit, 'to_bank=', bank_delta)
+                    bank += bank_delta
+                    capital = capital + keep_profit
+                else:
+                    # Loss but not liquidation
+                    if debug_left > 0:
+                        print('[MF] LOSS', 'entry=', day.iloc[pos]['timestamp'], 'lev_ret=', levered-1.0)
+                    capital = capital * levered
+
+            cap_post_trade = float(capital)
+            bank_post_trade = float(bank)
+
+            # Liquidation event: hard liquidation OR falling below capital floor
+            liq_floor = (not liq_hard) and (capital < args.cap_floor)
+            liquidation_event = bool(liq_hard or liq_floor)
+            liq_reason = 'hard' if liq_hard else ('floor' if liq_floor else '')
+
+            restart_amt = 0.0
+            restart_source = ''
+            if liquidation_event:
+                total_liquidations += 1
+                if debug_left > 0:
+                    print('[MF] LIQ_EVENT', liq_reason, 'cap_post=', capital, 'bank_post=', bank)
+                # Restart: only draw from bank once bank balance is above threshold
+                if float(bank) > float(args.bank_restart_min):
+                    restart_amt = float(args.restart_bank_frac) * float(bank)
+                    bank -= restart_amt
+                    capital = restart_amt
+                    restart_source = 'bank'
+                    if debug_left > 0:
+                        print('[MF] RESTART_FROM_BANK', 'amt=', restart_amt, 'bank_after=', bank)
+                else:
+                    capital = float(args.reseed_capital)
+                    restart_source = 'reseed'
+                    if debug_left > 0:
+                        print('[MF] RESTART_RESEED', capital)
+
             trades.append(TradeResult(
                 date=d,
                 entry_time=day.iloc[pos]['timestamp'],
@@ -305,8 +417,25 @@ def main():
                 exit_price=exit_price,
                 duration_min=int(feats.iloc[idx]['elapsed_min']),
                 trade_return_pct=trade_ret * 100.0 * args.leverage,
+                liquidated=liquidation_event,
+                liquidation_reason=liq_reason,
+                restart_source=restart_source,
+                restart_amount=float(restart_amt),
+                bank_delta=float(bank_delta),
+                capital_before=float(cap_before),
+                bank_before=float(bank_before),
+                capital_post_trade=float(cap_post_trade),
+                bank_post_trade=float(bank_post_trade),
+                capital_after=float(capital),
+                bank_after=float(bank),
             ))
+            if debug_left > 0:
+                print('[MF] POST', 'cap=', capital, 'bank=', bank, 'total=', capital+bank)
+                debug_left -= 1
             last_exit_ts = day.iloc[pos]['timestamp'] + timedelta(minutes=HOLD_MIN)
+        # Record end-of-day bank/capital
+        daily_capital_change_pct = ((capital - start_capital_day) / max(1e-9, start_capital_day)) * 100.0 if start_capital_day > 0 else 0.0
+        daily_bank_records.append({'date': d, 'end_capital': float(capital), 'bank_balance': float(bank), 'total_equity': float(capital + bank), 'daily_capital_change_pct': float(daily_capital_change_pct)})
 
     trades_df = pd.DataFrame([t.__dict__ for t in trades])
     OUT_TRADES.parent.mkdir(parents=True, exist_ok=True)
@@ -317,6 +446,11 @@ def main():
     else:
         daily = pd.DataFrame(columns=['date','daily_return_pct'])
     daily.to_csv(OUT_DAILY, index=False)
+
+    # Save bank/equity per-day file
+    bank_daily = pd.DataFrame(daily_bank_records)
+    bank_daily_path = Path(str(OUT_DAILY).replace('.csv', '_with_bank.csv'))
+    bank_daily.to_csv(bank_daily_path, index=False)
 
     # Metrics
     def max_drawdown(series):
@@ -340,7 +474,9 @@ def main():
         worst5 = 0.0
 
     print(f'Executed trades: {len(trades_df):,}')
-    print(f'Final capital (start=100): {capital:.2f}')
+    print(f'Final capital: {capital:.2f}')
+    print(f'Final bank: {bank:.2f}')
+    print(f'Final total equity: {capital + bank:.2f}')
     if len(daily):
         print('Avg daily %:', float(daily['daily_return_pct'].mean()))
         print('Median daily %:', float(daily['daily_return_pct'].median()))
@@ -366,6 +502,7 @@ def main():
             'max_rsi': args.max_rsi,
             'allow_hours': args.allow_hours,
             'leverage': args.leverage,
+            'start_capital': float(args.start_capital),
             'num_trades': int(len(trades_df)),
             'trade_days': int(len(daily)),
             'mean_trade_pct': float(trades_df['trade_return_pct'].mean()) if len(trades_df) else 0.0,
@@ -376,6 +513,9 @@ def main():
             'sortino': sortino,
             'worst5_daily_pct': worst5,
             'final_capital': float(capital),
+            'final_bank': float(bank),
+            'final_total_equity': float(capital + bank),
+            'total_liquidations': int(total_liquidations),
         }
         mo = Path(args.metrics_out)
         mo.parent.mkdir(parents=True, exist_ok=True)

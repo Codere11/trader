@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Timestamp (UTC): 2025-12-22T09:41:32Z",
+  "title": "trade_closed (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "event_time_utc",
+    "symbol",
+    "paper",
+    "entry_time_utc",
+    "exit_time_utc",
+    "entry_price",
+    "exit_price",
+    "fee_side",
+    "exit_rel_min",
+    "realized_ret_pct"
+  ],
+  "properties": {
+    "schema_version": { "const": "v1" },
+    "kind": { "const": "trade_closed" },
+    "run_id": { "type": "string", "minLength": 8 },
+    "event_time_utc": { "type": "string", "format": "date-time" },
+    "symbol": { "type": "string", "minLength": 3 },
+    "paper": { "type": "boolean" },
+    "entry_time_utc": { "type": "string", "format": "date-time" },
+    "exit_time_utc": { "type": "string", "format": "date-time" },
+    "entry_price": { "type": "number", "exclusiveMinimum": 0 },
+    "exit_price": { "type": "number", "exclusiveMinimum": 0 },
+    "fee_side": { "type": "number", "minimum": 0 },
+    "exit_rel_min": { "type": "integer", "minimum": 1 },
+    "realized_ret_pct": { "type": "number" },
+    "predicted_ret_pct": { "type": ["number", "null"] },
+    "entry_score": { "type": ["number", "null"] },
+    "entry_threshold": { "type": ["number", "null"] }
+  },
+  "additionalProperties": true
+}

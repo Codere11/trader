@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Timestamp (UTC): 2025-12-22T09:41:32Z",
+  "title": "run_meta (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "event_time_utc",
+    "mode",
+    "symbol",
+    "models",
+    "code_version"
+  ],
+  "properties": {
+    "schema_version": { "const": "v1" },
+    "kind": { "const": "run_meta" },
+    "run_id": { "type": "string", "minLength": 8 },
+    "event_time_utc": { "type": "string", "format": "date-time" },
+    "mode": { "type": "string", "enum": ["replay", "live"] },
+    "symbol": { "type": "string", "minLength": 3 },
+    "models": { "type": "object" },
+    "code_version": { "type": "object" }
+  },
+  "additionalProperties": true
+}

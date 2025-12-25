@@ -1,6 +1,32 @@
 DO NOT TOUCH
 
-Current best setup (as of 2025-12-18)
+Current best setup (as of 2025-12-20 14:46)
+- Pipeline: Entry regressor → Exit regressor (10‑minute window, greedy_causal; auto-close at 10m).
+- Key params:
+  * HOLD_MAX=10m (auto-close), fee_per_side=0.001; entry selection via causal per-day online threshold targeting ≈0.1% of minutes.
+- Models:
+  * Entry model (best): models/entry_regressor_btcusdt_2025-12-20T13-47-55Z.joblib
+  * Exit model (best):  models/exit_regressor_btcusdt_2025-12-20T14-41-31Z.joblib
+- Artifacts:
+  * Thresholds (online): data/exit_regression/entry_score_thresholds_online_2025-12-20T14-27-34Z.csv
+  * Selected entries:    data/exit_regression/entries_selected_online_2025-12-20T14-40-08Z.csv
+  * Exit dataset:        data/exit_regression/exit_reg_dataset_2025-12-20T14-41-08Z.parquet
+  * Eval outputs:        data/exit_regression/eval_exit_regressor_daily_2025-12-20T14-42-40Z.csv, .../eval_exit_regressor_trades_2025-12-20T14-42-40Z.csv
+- Eval (greedy_causal, per-day): 181 days; total sum +1612.86%; mean-of-means +0.57%/day; median-of-means +0.41%/day; win-rate 76.8%; top day +194.22% (2021-01-11); worst −6.64% (2025-10-10).
+
+How to rerun (causal)
+- Estimate thresholds (prior-days only):
+  python3 scripts/estimate_entry_score_threshold_online_2025-12-20T14-24-01Z.py --market-csv data/btc_profitability_analysis_filtered.csv --entry-model models/entry_regressor_btcusdt_2025-12-20T13-47-55Z.joblib
+- Select entries using thresholds:
+  python3 scripts/score_entries_with_threshold_online_2025-12-20T14-24-01Z.py --market-csv data/btc_profitability_analysis_filtered.csv --entry-model models/entry_regressor_btcusdt_2025-12-20T13-47-55Z.joblib --thresholds-csv data/exit_regression/entry_score_thresholds_online_2025-12-20T14-27-34Z.csv
+- Build exit dataset (10m horizon):
+  python3 scripts/build_exit_regression_dataset_2025-12-20T14-18-35Z.py --market-csv data/btc_profitability_analysis_filtered.csv --selected-entries data/exit_regression/entries_selected_online_2025-12-20T14-40-08Z.csv --hold-min 10 --fee 0.001
+- Train exit regressor:
+  python3 scripts/train_exit_regressor_btcusdt_2025-12-20T14-18-35Z.py --dataset data/exit_regression/exit_reg_dataset_2025-12-20T14-41-08Z.parquet
+- Evaluate offline (greedy_causal default):
+  python3 scripts/eval_exit_regressor_offline_2025-12-20T14-18-35Z.py --market-csv data/btc_profitability_analysis_filtered.csv --selected-entries data/exit_regression/entries_selected_online_2025-12-20T14-40-08Z.csv --exit-model models/exit_regressor_btcusdt_2025-12-20T14-41-31Z.joblib --hold-min 10 --fee 0.001
+
+Legacy setup (previous best as of 2025-12-18, retained for reference)
 - Pipeline: Entry ranker + preentry_mistake_filter -> Exit via exit_timing_model_weighted
 - Key params: K_PER_DAY=3, HOLD_MIN=8, THR_EXIT=0.50, MIN_PROFIT_PCT=0.10, leverage=1.0, peak-stop=disabled
 - Models:
@@ -14,6 +40,40 @@ Performance snapshot
 - 2024 (baseline): 121 trade-days; mean daily +3.02%; median +1.81%; win rate 88.4%; top day +37.37%; worst −6.31%.
 - 2025 YTD:        53 trade-days; mean daily +1.20%; median +1.51%; win rate 73.6%; top day +17.97%; worst −16.87%.
 
+Best rule-based entry (as of 2025-12-19)
+- Source: binance_adapter/sweep_rule_model.py task=rule_oracle on BTCUSDT_1m 2022-01-01..2025-12-18
+- Params: range_norm_min=0.0012, vwap_dev_max=0.0, require_any_neg_mom=True, max_hold=12
+- Metrics: n≈136k trades, win_rate≈0.853, mean_ret≈0.172% per trade, cum_ret_pct≈3.1e+103 (compounded, unlevered)
+- Saved config: data/pattern_runs/rule_sweeps/best_entry_rule_oracle.json
+
 Notes
-- Entry and exit are not simultaneous: entry chosen first from ranked list (gated by prefilter); exit evaluated minute-by-minute up to HOLD_MIN and triggered on probability/threshold.
-- To re-evaluate, run: python scripts/eval_buy_k3_filtered_exitmodel.py --start-date 2024-01-01 --end-date 2025-12-18 --k-per-day 3 --thr-exit 0.50 --min-profit-pct 0.10
+- Entry and exit are not simultaneous: entry selected first (causal per-day threshold); exit evaluated minute-by-minute up to 10 minutes using the exit regressor. Policy: greedy_causal (exit when current minute’s predicted return reaches a new high so far); fallback auto-close at minute 10.
+
+STRATEGY
+
+1) 100x leverage until account reaches 100,000EUR
+2) 50x leverage until account reaches 200,000EUR
+3) 20x leverage until account reaches 500,000EUR
+4) 10x leverage until account reaches 1 million EUR
+5) 1x leverage after that in perpertuity
+6) IMPORTANT -> For 100x and 50x leverage, half of the profit of each profitable trade is deposited in the bank/withdrawn
+7) Starting trading balance deposited: 30EUR
+8) If balance drops below 5EUR AND withdrawn/banked amount is less than 150EUR, refinance it up to 30EUR.
+9) If balance drops below 5EUR AND withdrawn/banked amount is 150EUR or more, 20% of the bank account is deposited back into the account, as the new starting balance for the account
+10) Bi-weekly retraining during quiet hours
+
+TRAINING
+
+11) Training works like this:
+	11.1) At every passing day, every perfect BUY trade for the past 4 years is generated
+	11.2) The entry and exit models are trained on 5-8 minutes of context before each profitable trade, learning to identify it (entry identifies perfect entry, exit identifies perfect exit)
+	11.3) Exit timing model labels are outcome-weighted: within minutes 3–8 after entry, minutes from eventually successful trades receive 3x sample weight; only minutes with since_entry_return_pct ≥ 0.10% are eligible
+	11.4) Exit timing model is LightGBM binary; train on dates ≤ TRAIN_END_DATE (chronological split), simulate on > TRAIN_END_DATE by choosing the first minute in [3,8] with p_exit ≥ THR; fallback exits at minute 8 if no threshold cross
+	11.5) THR sweep is performed each retrain (e.g. 0.35–0.55 step 0.05); the THR that maximizes total daily sum of since_entry_return_pct on the simulation period becomes THR_EXIT
+	11.6) Pre-entry mistake filter is trained on failures_precontext (y=1) vs winners_precontext_sample (y=0) with LightGBM; operating threshold chosen to achieve ≥0.65 precision on failures with maximal recall
+	11.7) Both models save a payload with: model artifact, exact feature list (order preserved), and the operating threshold(s); artifacts are versioned by train end date and linked to “latest”
+	11.8) Causality guardrails: only rolling/expanding within-day stats; no whole-day lookahead; feature generation is validated to ensure no columns leak future information beyond label construction
+	11.9) Chronological evaluation: report per-day metrics (win rate, mean/median daily PnL, worst/top day) and export per-trade selections; keep identical evaluation window to the strategy’s current reporting
+	11.10) Promotion policy: generate candidate signals for (a) the last 4 years and (b) the last 7 calendar days (ending yesterday); compare to the current live pair on the same horizons using identical settings (K_PER_DAY, THR_EXIT, MIN_PROFIT_PCT, leverage); promote only if candidate is not worse on BOTH horizons across primary metrics: total PnL ≥ live, mean daily PnL ≥ live, and max drawdown ≤ live; if either horizon is worse on any primary metric, do not update
+	11.11) Drift checks at retrain: compare feature distributions (KS test) vs prior training; if >10% of features drift (p<0.01), trigger a feature audit and freeze promotion
+	11.12) Reproducibility: fix random seeds, persist TRAIN_END_DATE, hashes of input CSVs, and git commit id; write a training_manifest.json alongside artifacts

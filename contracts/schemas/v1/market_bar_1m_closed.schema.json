@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Timestamp (UTC): 2025-12-22T09:41:32Z",
+  "title": "market_bar_1m_closed (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "event_time_utc",
+    "symbol",
+    "source",
+    "interval",
+    "bar_open_time_utc",
+    "bar_close_time_utc",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume"
+  ],
+  "properties": {
+    "schema_version": { "const": "v1" },
+    "kind": { "const": "market_bar_1m_closed" },
+    "run_id": { "type": "string", "minLength": 8 },
+    "event_time_utc": { "type": "string", "format": "date-time" },
+    "symbol": { "type": "string", "minLength": 3 },
+    "source": { "type": "string", "minLength": 3 },
+    "interval": { "const": "1m" },
+    "bar_open_time_utc": { "type": "string", "format": "date-time" },
+    "bar_close_time_utc": { "type": "string", "format": "date-time" },
+    "open": { "type": "number" },
+    "high": { "type": "number" },
+    "low": { "type": "number" },
+    "close": { "type": "number" },
+    "volume": { "type": "number", "minimum": 0 }
+  },
+  "additionalProperties": true
+}

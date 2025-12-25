@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Timestamp (UTC): 2025-12-22T14:20:49Z",
+  "title": "trade_mode_switch (v1)",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "kind",
+    "run_id",
+    "event_time_utc",
+    "symbol",
+    "from_trade_mode",
+    "to_trade_mode",
+    "reason"
+  ],
+  "properties": {
+    "schema_version": { "const": "v1" },
+    "kind": { "const": "trade_mode_switch" },
+    "run_id": { "type": "string", "minLength": 8 },
+    "event_time_utc": { "type": "string", "format": "date-time" },
+    "symbol": { "type": "string", "minLength": 3 },
+    "from_trade_mode": { "type": "string", "enum": ["paper", "auto", "real"] },
+    "to_trade_mode": { "type": "string", "enum": ["paper", "auto", "real"] },
+    "reason": { "type": "string", "minLength": 3 }
+  },
+  "additionalProperties": true
+}

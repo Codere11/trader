@@ -79,5 +79,17 @@ Thumbs.db
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Models are generally large and generated; keep them out of git by default.
 models/
 *.joblib
+
+# But DO commit the exact dYdX live models used by the runner.
+!models/
+models/*
+!models/entry_regressor_btcusdt_2025-12-20T13-47-55Z.joblib
+!models/exit_regressor_btcusdt_2025-12-20T14-41-31Z.joblib
+
+# Data (generated / large)
+data/**
+!data/splits.json

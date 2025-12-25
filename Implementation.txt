@@ -1,0 +1,60 @@
+Timestamp (UTC): 2025-12-22T09:32:04Z
+
+Title: Live Trading Rollout Plan (Paper → Threshold Gate → Minimal Live)
+
+Problem statement
+We need to move from backtests to a safe, staged live pipeline that (1) defines the exact real-time features and data schemas for model entry/exit decisions, (2) validates the live data loop with paper trades, (3) adds end-of-day (EOD) reporting and an automatic threshold-based switch to real trading, and (4) deploys a minimal live system in the cloud (dockerized). We must also precisely handle Binance leverage and max position limits.
+
+Current state (brief)
+- Backtests exist with known features and thresholds.
+- No fully validated live data ingestion + decision + broker execution loop in production.
+- No automated EOD reporting pipeline.
+- Deployment and infra are not yet containerized.
+
+Plan
+1) Define data contracts for real-time decisioning
+- Entry model: enumerate features (exact symbols, resolutions, lookback windows, normalization), required market data (L1 quotes, trades, candles), required account data (free balance, position, fees), and the exact price field used (e.g., last trade or mark price). Output schema: action + score/rank + confidence + timestamp + symbol.
+- Exit model: same feature spec as entry, plus exact PnL inputs since entry (realized/unrealized), average entry price, fees, funding, slippage estimate. Output schema mirrors entry with exit_reason.
+- Unify a single message schema (JSON/Parquet) with strict types, units (quote ccy), and time in UTC, with a version field. Document allowed NaNs and backfilling rules.
+- Define latency budgets per stage (ingest → feature build → model infer → route). Add metrics to measure them.
+
+2) Live feed dry-run with paper trading
+- Stand up a paper broker adapter that mirrors the real broker interface: submit/cancel/modify order, position snapshot, fills, stream of executions.
+- Wire real market data stream to the feature builder and model. Drive “mock” signals (fixed rule or scripted pulse) to validate the full path: data → features → inference → ranking → routing → paper order → fill → state update.
+- Record full audit logs: inputs, features, model outputs, decisions, orders, fills. Persist to append-only storage with run_id.
+- Define validation checks: data freshness, feature completeness %, inference SLA, order ack/fill within N seconds.
+
+3) EOD reporting and threshold gate to real trading
+- Generate daily summary (UTC cutover) of paper trades: counts, win rate, mean/median PnL, PnL by symbol, slippage vs mark, fees, funding, exposure, violations.
+- Include model diagnostics: feature drift, score distribution, hit ratio by decile, latency stats.
+- Deliver via email and store the same report as an artifact (HTML + CSV attachments) in object storage.
+- Gate: if trades ≥ 5 and performance ≥ threshold(s) identical to backtest spec, schedule a human-ack step to enable live trading; gate is code-enforced and must be manually flipped.
+
+4) Dockerize and deploy minimal live system
+- Create docker images for: data/feature service, inference service, router/executor, report generator, and a shared library image.
+- Provision a small cloud runtime (single-node to start) with secrets managed via the platform’s secret store.
+- Add health checks, structured logging, metrics (Prometheus/OpenTelemetry), and alerts on critical SLOs.
+- Blue/green (or canary) deploy for inference so we can roll back instantly.
+
+5) Binance leverage and max position limits
+- Implement a limits service that queries exchange info (symbol filters, leverage brackets, notional/qty steps) at startup and on schedule; cache and expose via API.
+- Pre-trade checks: compute max allowable leverage and notional for the current account equity and instrument; clamp orders accordingly. Always choose the exchange’s max permitted leverage per symbol while maintaining risk constraints we set (e.g., max loss per trade/day).
+
+6) Parity with backtest
+- Codify backtest parameters (features, thresholds, slippage/fees, risk rules) as config that both backtest and live use. No branching logic between modes; only data sources differ.
+- Add a reproducibility harness: given a trade id, replay live data to reproduce the decision.
+
+Deliverables
+- Data contract docs and schemas in repository.
+- Paper trading loop operational with audit logging.
+- Automated EOD email reports with stored artifacts.
+- Dockerized services with CI build and minimal cloud deployment.
+- Limits service enforcing Binance leverage/notional rules pre-trade.
+- Config parity with backtest and a replay tool.
+
+Open questions
+- Exact feature list and windows to freeze for v1 entry/exit.
+- Target inference latency budget and acceptable data staleness.
+- Thresholds copied from backtests (values and lookback) and which metrics gate go-live.
+- Minimum viable cloud target (provider and services) and email provider choice.
+- Symbols to support for v1 (BTCUSDT only or more).

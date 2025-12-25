@@ -1,0 +1,23 @@
+# Timestamp (UTC): 2025-12-22T17:35:36Z
+
+.git
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.venv/
+venv/
+
+.env
+.env.*
+
+*.log
+
+# Exclude all data by default (mount ./data/live as a volume)
+data/
+
+# Keep seed thresholds used by default CLI args
+!data/exit_regression/
+data/exit_regression/*
+!data/exit_regression/entry_score_thresholds_online_*.csv

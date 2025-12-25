@@ -1,0 +1,95 @@
+# Timestamp (UTC): 2025-12-22T17:35:36Z
+services:
+  bot:
+    build: .
+    image: plus500-autotrader:latest
+    restart: unless-stopped
+    environment:
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+      EMAIL_TO: ${EMAIL_TO}
+      EMAIL_FROM: ${EMAIL_FROM}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_STARTTLS: ${SMTP_STARTTLS}
+      SMTP_SSL: ${SMTP_SSL}
+    volumes:
+      - ./data/live:/app/data/live
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "scripts/healthcheck.py", "--port", "8000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    command:
+      - python3
+      - scripts/live_paper_trade_2025-12-20T15-01-14Z.py
+      - --mode
+      - live
+      - --trade-mode
+      - auto
+      - --gate-window
+      - "5"
+      - --trade-margin-eur
+      - "15"
+      - --max-open-real
+      - "1"
+      - --metrics-port
+      - "8000"
+      - --health-max-staleness-sec
+      - "120"
+
+  dydx_bot:
+    build: .
+    image: plus500-autotrader:latest
+    restart: unless-stopped
+    environment:
+      DYDX_ENV: ${DYDX_ENV}
+      DYDX_MNEMONIC: ${DYDX_MNEMONIC}
+      DYDX_ADDRESS: ${DYDX_ADDRESS}
+      DYDX_NODE_GRPC: ${DYDX_NODE_GRPC}
+      DYDX_INDEXER_REST: ${DYDX_INDEXER_REST}
+      DYDX_INDEXER_WS: ${DYDX_INDEXER_WS}
+      DYDX_MARKET: ${DYDX_MARKET}
+      DYDX_SUBACCOUNT_TRADING: ${DYDX_SUBACCOUNT_TRADING}
+      DYDX_SUBACCOUNT_BANK: ${DYDX_SUBACCOUNT_BANK}
+      DYDX_TRADE_FLOOR_USDC: ${DYDX_TRADE_FLOOR_USDC}
+      DYDX_PROFIT_SIPHON_FRAC: ${DYDX_PROFIT_SIPHON_FRAC}
+      DYDX_BANK_THRESHOLD_USDC: ${DYDX_BANK_THRESHOLD_USDC}
+      DYDX_LIQUIDATION_RECAP_BANK_FRAC: ${DYDX_LIQUIDATION_RECAP_BANK_FRAC}
+      DYDX_FEE_SIDE: ${DYDX_FEE_SIDE}
+      DYDX_MAX_LEVERAGE: ${DYDX_MAX_LEVERAGE}
+      DYDX_USE_MARGIN_FRAC: ${DYDX_USE_MARGIN_FRAC}
+      DYDX_LEVERAGE_SAFETY_FRAC: ${DYDX_LEVERAGE_SAFETY_FRAC}
+    volumes:
+      - ./data/live_dydx:/app/data/live_dydx
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD", "python3", "scripts/healthcheck.py", "--port", "8001"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    command:
+      - python3
+      - scripts/live_dydx_v4_btc_usd_2025-12-24T13-14-02Z.py
+      - --trade-mode
+      - real
+      - --yes-really
+      - --out-dir
+      - /app/data/live_dydx
+      - --bank-log
+      - /app/data/live_dydx/bank_proof.jsonl
+      - --metrics-port
+      - "8001"
+      - --health-max-staleness-sec
+      - "120"
+      - --stall-seconds
+      - "300"
+      - --retention-days
+      - "0"
