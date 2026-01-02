@@ -2143,25 +2143,41 @@ class DydxRunner:
         if k_rel > 10:
             k_rel = 10
 
-        updated = False
+        # Exit policy (FIX): hold up to 10 minutes, but allow early exit only when the
+        # exit model *deteriorates* vs the best prediction seen so far (after at least 2 minutes).
+        #
+        # Previous behavior exited immediately on the first "new best" (k_rel=1 for almost every trade).
+        exit_signal = False
+        pred_at_exit: Optional[float] = None
+
         yhat: Optional[float] = None
         if not self._missing_exit_cols:
             try:
                 yhat = float(self._predict_exit_index(i))
             except Exception:
                 yhat = None
+
+        prev_best = float(tr.get("running_best", -1e30))
         if yhat is not None and np.isfinite(yhat):
-            if yhat >= float(tr.get("running_best", -1e30)):
+            pred_at_exit = float(yhat)
+            if float(yhat) >= float(prev_best):
                 tr["running_best"] = float(yhat)
                 tr["best_k"] = int(k_rel)
-                updated = True
+            else:
+                # Don't allow 1-minute exits; require at least 2 minutes in-trade.
+                if int(k_rel) >= 2:
+                    exit_signal = True
 
-        if updated or k_rel >= 10:
-            exit_k = int(tr.get("best_k") or 10)
+        if exit_signal or k_rel >= 10:
+            exit_k = int(k_rel)
             exit_time = ts + timedelta(minutes=1)
 
-            pred_raw = float(tr.get("running_best", float("nan")))
-            pred = float(pred_raw) if np.isfinite(pred_raw) and pred_raw > -1e29 else None
+            # Prefer the model output at the moment we decided to exit; fall back to running best.
+            if pred_at_exit is not None and np.isfinite(float(pred_at_exit)):
+                pred = float(pred_at_exit)
+            else:
+                pred_raw = float(tr.get("running_best", float("nan")))
+                pred = float(pred_raw) if np.isfinite(pred_raw) and pred_raw > -1e29 else None
 
             # Bank-proof snapshot right before we attempt to exit a real trade.
             if str(tr.get("trade_mode") or "").lower() == "real":
