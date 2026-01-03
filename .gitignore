@@ -93,3 +93,16 @@ models/*
 # Data (generated / large)
 data/**
 !data/splits.json
+
+# --- REQUIRED live dYdX artifacts (keep the repo deployable from a fresh clone) ---
+!data/
+
+# Entry model artifact
+!data/pattern_entry_regressor/
+data/pattern_entry_regressor/*
+!data/pattern_entry_regressor/pattern_entry_regressor_v2_2026-01-02T23-51-17Z.joblib
+
+# Exit-gap model artifact
+!data/exit_oracle/
+data/exit_oracle/*
+!data/exit_oracle/exit_oracle_gap_regressor_hold15_2026-01-03T16-13-20Z.joblib
