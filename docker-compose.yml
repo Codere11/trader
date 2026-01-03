@@ -67,6 +67,7 @@ services:
       DYDX_LEVERAGE_SAFETY_FRAC: ${DYDX_LEVERAGE_SAFETY_FRAC}
     volumes:
       - ./data/live_dydx:/app/data/live_dydx
+      - ./data/pattern_entry_regressor:/app/data/pattern_entry_regressor:ro
     ports:
       - "127.0.0.1:8001:8001"
     healthcheck:
@@ -81,6 +82,12 @@ services:
       - --trade-mode
       - real
       - --yes-really
+      - --entry-model
+      - /app/data/pattern_entry_regressor/pattern_entry_regressor_v2_2026-01-02T23-51-17Z.joblib
+      - --hold-min
+      - "15"
+      - --target-frac
+      - "0.001"
       - --out-dir
       - /app/data/live_dydx
       - --bank-log

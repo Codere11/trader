@@ -7,10 +7,13 @@ Implements the two-subaccount scheme:
 - bank subaccount: receives a configurable fraction of realized profits after each closed trade (default 30%)
 - if trading equity drops below a floor, top up from bank back to the floor (between trades)
 
-Strategy logic:
-- Features: computed via compute_feature_frame() (same as BTCUSDT live runner)
-- Entry: score vs causal per-day threshold (quantile of prior-day scores)
-- Exit: mirrors existing live runner logic (greedy_causal style, max 10 minutes)
+Strategy logic (UPDATED 2026-01-03):
+- Entry model: pattern_entry_regressor_v2 (dYdX-trained) using the same feature engineering as offline training.
+- Entry selection: causal per-day online threshold (quantile of prior scores) targeting --target-frac.
+- Exit: simple fixed hold to --hold-min minutes (no exit model, no policy sweep).
+
+Notes:
+- Backfill is required so rolling features (incl. 1d z-scores) are defined.
 
 WARNING: In --trade-mode real, this places real orders and transfers.
 """
@@ -54,6 +57,103 @@ from contracts.v1 import (
 
 from binance_adapter.crossref_oracle_vs_agent_patterns import FEATURES, compute_feature_frame
 
+
+# --- Pattern entry v2 feature engineering (must match training) ---
+
+def _slope5(series: pd.Series) -> pd.Series:
+    # x = [-2,-1,0,1,2]
+    return ((-2.0 * series.shift(4)) + (-1.0 * series.shift(3)) + (1.0 * series.shift(1)) + (2.0 * series)) / 10.0
+
+
+def _accel5(series: pd.Series) -> pd.Series:
+    return (series - 2.0 * series.shift(2) + series.shift(4)) / 2.0
+
+
+def _zscore_roll(s: pd.Series, win: int) -> pd.Series:
+    mu = s.rolling(int(win), min_periods=int(win)).mean()
+    sd = s.rolling(int(win), min_periods=int(win)).std()
+    return (s - mu) / (sd + 1e-12)
+
+
+def build_entry_pattern_frame_v2(bars: pd.DataFrame, base_features: List[str]) -> pd.DataFrame:
+    """Build the v2 pattern frame used by pattern_entry_regressor_v2.
+
+    Must match scripts/pattern_entry_regressor_oracle_sweep_v2_2026-01-02T23-28-15Z.py.
+    """
+    bars = bars.copy().sort_values("timestamp").reset_index(drop=True)
+    bars["ts_min"] = pd.to_datetime(bars["timestamp"]).dt.floor("min")
+
+    base = compute_feature_frame(bars)
+    src = base[[c for c in FEATURES if c in base.columns]]
+
+    missing = [f for f in base_features if f not in src.columns]
+    if missing:
+        raise ValueError(f"Missing required base features: {missing}")
+
+    df = pd.DataFrame({"timestamp": pd.to_datetime(bars["timestamp"], utc=True)})
+
+    # 5-minute pattern descriptors
+    for f in base_features:
+        s = pd.to_numeric(src[f], errors="coerce")
+        df[f"{f}__last"] = s
+        df[f"{f}__slope5"] = _slope5(s)
+        df[f"{f}__accel5"] = _accel5(s)
+        df[f"{f}__std5"] = s.rolling(5, min_periods=5).std()
+        df[f"{f}__min5"] = s.rolling(5, min_periods=5).min()
+        df[f"{f}__max5"] = s.rolling(5, min_periods=5).max()
+        df[f"{f}__range5"] = df[f"{f}__max5"] - df[f"{f}__min5"]
+
+    # Cross-feature correlations
+    pairs = [
+        ("macd", "ret_1m_pct"),
+        ("vol_std_5m", "ret_1m_pct"),
+        ("range_norm_5m", "ret_1m_pct"),
+    ]
+    for a, b in pairs:
+        if a in base_features and b in base_features:
+            df[f"corr5__{a}__{b}"] = pd.to_numeric(src[a], errors="coerce").rolling(5, min_periods=5).corr(
+                pd.to_numeric(src[b], errors="coerce")
+            )
+
+    # Price context
+    close = pd.to_numeric(bars["close"], errors="coerce")
+    high = pd.to_numeric(bars["high"], errors="coerce")
+    low = pd.to_numeric(bars["low"], errors="coerce")
+
+    df["px__ret1m_close"] = close.pct_change() * 100.0
+    df["px__ret1m_abs"] = df["px__ret1m_close"].abs()
+    df["px__range_norm1m"] = (high - low) / (close + 1e-12)
+    df["px__range_norm1m_abs"] = df["px__range_norm1m"].abs()
+
+    # New indicators: spike/pump/vol regime
+    win = 1440
+    df["z1d__px_ret1m"] = _zscore_roll(df["px__ret1m_close"], win)
+    df["z1d__px_ret1m_abs"] = df["z1d__px_ret1m"].abs()
+    df["z1d__px_range1m"] = _zscore_roll(df["px__range_norm1m"], win)
+    df["z1d__px_range1m_abs"] = df["z1d__px_range1m"].abs()
+
+    # Context baselines
+    vol5 = df.get("vol_std_5m__last")
+    rng5max = df.get("range_norm_5m__max5")
+    if vol5 is not None:
+        df["z1d__vol5"] = _zscore_roll(pd.to_numeric(vol5, errors="coerce"), win)
+        df["risk__ret1m_abs_over_vol5"] = df["px__ret1m_abs"] / (pd.to_numeric(vol5, errors="coerce").abs() + 1e-9)
+        df["risk__range1m_over_vol5"] = df["px__range_norm1m"] / (pd.to_numeric(vol5, errors="coerce").abs() + 1e-9)
+
+    if rng5max is not None:
+        df["risk__range1m_over_range5max"] = df["px__range_norm1m"] / (pd.to_numeric(rng5max, errors="coerce").abs() + 1e-12)
+
+    # Directional decomposition
+    if "ret_1m_pct__last" in df.columns:
+        df["ret_1m_pct__last_pos"] = df["ret_1m_pct__last"].clip(lower=0.0)
+        df["ret_1m_pct__last_neg"] = (-df["ret_1m_pct__last"]).clip(lower=0.0)
+
+    # Simple extreme flags
+    df["flag__ret1m_abs_z_gt3"] = (df["z1d__px_ret1m_abs"] > 3.0).astype(np.float32)
+    df["flag__range1m_abs_z_gt3"] = (df["z1d__px_range1m_abs"] > 3.0).astype(np.float32)
+
+    return df
+
 from dydx_adapter import load_dotenv
 from dydx_adapter.v4 import DydxV4Config, connect_v4, new_client_id, usdc_to_quantums
 
@@ -84,8 +184,13 @@ def _pb_to_jsonable(x: Any) -> Any:
 @dataclass
 class Models:
     entry_model: Any
-    exit_model: Any
     entry_features: List[str]
+
+    # Pattern entry v2 uses these base features to build its derived frame.
+    entry_base_features: List[str]
+
+    # Optional legacy exit model (disabled for the fixed-hold strategy).
+    exit_model: Optional[Any]
     exit_features: List[str]
 
     # Context windows used during training (if present in the artifacts).
@@ -372,34 +477,55 @@ def _infer_pre_mins_from_features(feat_names: List[str]) -> List[int]:
     return sorted(mins)
 
 
-def load_models(entry_path: Path, exit_path: Path) -> Models:
+def load_models(entry_path: Path, exit_path: Optional[Path]) -> Models:
     eobj = joblib.load(entry_path)
-    xobj = joblib.load(exit_path)
 
-    if not isinstance(eobj, dict) or "model" not in eobj or "features" not in eobj:
+    if not isinstance(eobj, dict) or "model" not in eobj:
         raise SystemExit(f"Unexpected entry model artifact format: {entry_path}")
-    if not isinstance(xobj, dict) or "model" not in xobj or "features" not in xobj:
-        raise SystemExit(f"Unexpected exit model artifact format: {exit_path}")
 
-    entry_feats = list(eobj.get("features") or [])
-    exit_feats = list(xobj.get("features") or [])
+    # Support both legacy entry artifacts (key: 'features') and pattern_entry_regressor_v2 artifacts (key: 'feature_cols').
+    if "features" in eobj:
+        entry_feats = list(eobj.get("features") or [])
+    elif "feature_cols" in eobj:
+        entry_feats = list(eobj.get("feature_cols") or [])
+    else:
+        raise SystemExit(f"Entry model artifact missing 'features' or 'feature_cols': {entry_path}")
+
+    entry_base_features = list(eobj.get("base_features") or ["macd", "ret_1m_pct", "mom_5m_pct", "vol_std_5m", "range_norm_5m"])
 
     entry_pre_min = int(_parse_pre_min(eobj))
-    exit_pre_min = int(_parse_pre_min(xobj))
+
+    exit_model = None
+    exit_feats: List[str] = []
+    exit_pre_min = 0
+    exit_artifact = ""
+    exit_created_utc: Optional[str] = None
+
+    if exit_path is not None and str(exit_path).strip():
+        xobj = joblib.load(exit_path)
+        if not isinstance(xobj, dict) or "model" not in xobj or "features" not in xobj:
+            raise SystemExit(f"Unexpected exit model artifact format: {exit_path}")
+        exit_model = xobj["model"]
+        exit_feats = list(xobj.get("features") or [])
+        exit_pre_min = int(_parse_pre_min(xobj))
+        exit_artifact = Path(exit_path).name
+        exit_created_utc = xobj.get("created_utc")
+
     pre_min = int(max(entry_pre_min, exit_pre_min, 0))
 
     return Models(
         entry_model=eobj["model"],
-        exit_model=xobj["model"],
         entry_features=entry_feats,
+        entry_base_features=entry_base_features,
+        exit_model=exit_model,
         exit_features=exit_feats,
-        entry_pre_min=int(entry_pre_min),
-        exit_pre_min=int(exit_pre_min),
-        pre_min=int(pre_min),
-        entry_artifact=str(Path(entry_path).name),
-        exit_artifact=str(Path(exit_path).name),
-        entry_created_utc=(str(eobj.get("created_utc")) if eobj.get("created_utc") else None),
-        exit_created_utc=(str(xobj.get("created_utc")) if xobj.get("created_utc") else None),
+        entry_pre_min=entry_pre_min,
+        exit_pre_min=exit_pre_min,
+        pre_min=pre_min,
+        entry_artifact=Path(entry_path).name,
+        exit_artifact=exit_artifact,
+        entry_created_utc=eobj.get("created_utc"),
+        exit_created_utc=exit_created_utc,
     )
 
 
@@ -862,6 +988,7 @@ class DydxRunner:
         market: str,
         models: Models,
         target_frac: float,
+        hold_min: int,
         out_dir: Path,
         trade_mode: str,
         backfill_hours: int,
@@ -882,6 +1009,7 @@ class DydxRunner:
         self.market = str(market).upper()
         self.models = models
         self.target_frac = float(target_frac)
+        self.hold_min = int(hold_min)
         self.out_dir = Path(out_dir)
         self.trade_mode = str(trade_mode).lower().strip()
         self.backfill_hours = int(backfill_hours)
@@ -1293,13 +1421,35 @@ class DydxRunner:
         return np.inf
 
     def _ensure_feats(self) -> None:
-        out, missing = build_feature_frame(self.bars, self._req_pre_mins, self._feat_union, return_missing=True)
-        self.feats = out
+        # For the v2 pattern entry model we build the same derived frame used in training.
+        try:
+            pat = build_entry_pattern_frame_v2(self.bars, base_features=self.models.entry_base_features)
+        except Exception as e:
+            self.feats = None
+            self._missing_cols = list(self.models.entry_features)
+            self._missing_entry_cols = list(self.models.entry_features)
+            self._missing_exit_cols = []
+            self._alert("feature_build_error", "Failed to build pattern entry features", error=str(e))
+            return
+
+        self.feats = pat
+
+        i = len(self.bars) - 1
+        # Training required >= 1 day warmup for z1d_* indicators.
+        if int(i) < 1440:
+            self._missing_cols = list(self.models.entry_features)
+            self._missing_entry_cols = list(self.models.entry_features)
+            self._missing_exit_cols = []
+            return
+
+        row = self.feats.loc[i, self.models.entry_features]
+        vals = pd.to_numeric(row, errors="coerce").to_numpy(dtype=np.float64)
+        bad = ~np.isfinite(vals)
+        missing = [c for c, b in zip(self.models.entry_features, bad) if bool(b)]
 
         self._missing_cols = list(missing)
-        ms = set(missing)
-        self._missing_entry_cols = [c for c in self.models.entry_features if c in ms]
-        self._missing_exit_cols = [c for c in self.models.exit_features if c in ms]
+        self._missing_entry_cols = list(missing)
+        self._missing_exit_cols = []
 
     def _persist_bar(self, row: Mapping[str, Any]) -> None:
         d = pd.to_datetime(row["timestamp"], utc=True).date()
@@ -1410,9 +1560,8 @@ class DydxRunner:
         return float(self.models.entry_model.predict(x)[0])
 
     def _predict_exit_index(self, i: int) -> float:
-        assert self.feats is not None
-        x = self.feats.loc[i, self.models.exit_features].to_numpy(dtype=np.float32)[None, :]
-        return float(self.models.exit_model.predict(x)[0])
+        # Exit model disabled in fixed-hold mode.
+        raise RuntimeError("Exit model disabled")
 
     async def _open_real_long(self, *, equity_before: float) -> Dict[str, Any]:
         mk = await _fetch_market_meta(self.clients, self.market)
@@ -1709,17 +1858,19 @@ class DydxRunner:
         if self.cur_day is None:
             self.cur_day = d
             # Seed scores for prior days from existing backfill (entry model only).
+            # Keep it consistent with training: require warmup + finite feature rows.
             if self.feats is not None and len(self.feats) > 0 and not self._missing_entry_cols:
                 try:
-                    df_scores = pd.DataFrame(
-                        {
-                            "timestamp": self.feats["timestamp"],
-                            "score": self.models.entry_model.predict(self.feats[self.models.entry_features].to_numpy(dtype=np.float32)),
-                        }
-                    )
-                    df_scores["date"] = pd.to_datetime(df_scores["timestamp"]).dt.date
-                    prior = df_scores[df_scores["date"] < d]["score"].tolist()
-                    self.prior_scores.extend([float(x) for x in prior])
+                    X_df = self.feats[self.models.entry_features]
+                    good = np.isfinite(X_df.to_numpy(np.float64)).all(axis=1)
+                    good &= (np.arange(len(X_df), dtype=np.int64) >= 1440)
+
+                    if np.any(good):
+                        scores = self.models.entry_model.predict(X_df.iloc[np.where(good)[0]].to_numpy(dtype=np.float32))
+                        df_scores = pd.DataFrame({"timestamp": self.feats.loc[np.where(good)[0], "timestamp"], "score": scores})
+                        df_scores["date"] = pd.to_datetime(df_scores["timestamp"]).dt.date
+                        prior = df_scores[df_scores["date"] < d]["score"].tolist()
+                        self.prior_scores.extend([float(x) for x in prior])
                 except Exception:
                     pass
 
@@ -1925,8 +2076,9 @@ class DydxRunner:
 
         planned_entry_ts = ts + timedelta(minutes=1)
 
-        # Block NEW entries unless BOTH models have all required columns.
-        ready_for_new_entries = (not self._missing_entry_cols) and (not self._missing_exit_cols)
+        # Block NEW entries unless the entry model has all required columns.
+        # Exit model is disabled for the fixed-hold strategy.
+        ready_for_new_entries = (not self._missing_entry_cols)
 
         if (
             ready_for_new_entries
@@ -2140,44 +2292,17 @@ class DydxRunner:
         k_rel = int(i - j0)
         if k_rel <= 0:
             return
-        if k_rel > 10:
-            k_rel = 10
+        # Fixed-hold exit: close after hold_min minutes.
+        hold_min = int(getattr(self, "hold_min", 15))
 
-        # Exit policy (FIX): hold up to 10 minutes, but allow early exit only when the
-        # exit model *deteriorates* vs the best prediction seen so far (after at least 2 minutes).
-        #
-        # Previous behavior exited immediately on the first "new best" (k_rel=1 for almost every trade).
-        exit_signal = False
-        pred_at_exit: Optional[float] = None
+        # Cap k_rel for reporting.
+        if k_rel > int(hold_min):
+            k_rel = int(hold_min)
 
-        yhat: Optional[float] = None
-        if not self._missing_exit_cols:
-            try:
-                yhat = float(self._predict_exit_index(i))
-            except Exception:
-                yhat = None
-
-        prev_best = float(tr.get("running_best", -1e30))
-        if yhat is not None and np.isfinite(yhat):
-            pred_at_exit = float(yhat)
-            if float(yhat) >= float(prev_best):
-                tr["running_best"] = float(yhat)
-                tr["best_k"] = int(k_rel)
-            else:
-                # Don't allow 1-minute exits; require at least 2 minutes in-trade.
-                if int(k_rel) >= 2:
-                    exit_signal = True
-
-        if exit_signal or k_rel >= 10:
+        if int(k_rel) >= int(hold_min):
             exit_k = int(k_rel)
             exit_time = ts + timedelta(minutes=1)
-
-            # Prefer the model output at the moment we decided to exit; fall back to running best.
-            if pred_at_exit is not None and np.isfinite(float(pred_at_exit)):
-                pred = float(pred_at_exit)
-            else:
-                pred_raw = float(tr.get("running_best", float("nan")))
-                pred = float(pred_raw) if np.isfinite(pred_raw) and pred_raw > -1e29 else None
+            pred = None
 
             # Bank-proof snapshot right before we attempt to exit a real trade.
             if str(tr.get("trade_mode") or "").lower() == "real":
@@ -2736,11 +2861,20 @@ def main() -> None:
     load_dotenv(Path(".env"), override=False)
 
     ap = argparse.ArgumentParser(description="Live dYdX v4 BTC-USD runner (bank+trading subaccounts)")
-    ap.add_argument("--entry-model", default=str(REPO_ROOT / "models" / "entry_regressor_btcusdt_2025-12-20T13-47-55Z.joblib"))
-    ap.add_argument("--exit-model", default=str(REPO_ROOT / "models" / "exit_regressor_btcusdt_2025-12-20T14-41-31Z.joblib"))
+    ap.add_argument(
+        "--entry-model",
+        default=str(REPO_ROOT / "data" / "pattern_entry_regressor" / "pattern_entry_regressor_v2_2026-01-02T23-51-17Z.joblib"),
+        help="Entry model artifact. Supports both legacy (features) and pattern v2 (feature_cols).",
+    )
+    ap.add_argument(
+        "--exit-model",
+        default="",
+        help="Optional legacy exit model artifact. Leave empty to disable (fixed-hold strategy).",
+    )
 
     ap.add_argument("--market", default=os.getenv("DYDX_MARKET", "BTC-USD"))
     ap.add_argument("--target-frac", type=float, default=0.001)
+    ap.add_argument("--hold-min", type=int, default=15)
 
     ap.add_argument("--trade-mode", choices=["paper", "real"], default="paper")
     ap.add_argument("--yes-really", action="store_true", help="Required for --trade-mode real")
@@ -2813,7 +2947,8 @@ def main() -> None:
     cfg = DydxV4Config.from_env()
     cfg.market = str(args.market).upper()
 
-    models = load_models(Path(args.entry_model), Path(args.exit_model))
+    exit_path = Path(args.exit_model) if str(args.exit_model).strip() else None
+    models = load_models(Path(args.entry_model), exit_path)
 
     out_dir = Path(args.out_dir)
 
@@ -2938,6 +3073,7 @@ def main() -> None:
                 market=str(cfg.market),
                 models=models,
                 target_frac=float(args.target_frac),
+                hold_min=int(args.hold_min),
                 out_dir=Path(out_dir),
                 trade_mode=str(args.trade_mode),
                 backfill_hours=int(args.backfill_hours),
