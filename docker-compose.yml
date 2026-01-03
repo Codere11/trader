@@ -68,6 +68,7 @@ services:
     volumes:
       - ./data/live_dydx:/app/data/live_dydx
       - ./data/pattern_entry_regressor:/app/data/pattern_entry_regressor:ro
+      - ./data/exit_oracle:/app/data/exit_oracle:ro
     ports:
       - "127.0.0.1:8001:8001"
     healthcheck:
@@ -82,12 +83,20 @@ services:
       - --trade-mode
       - real
       - --yes-really
+      - --backfill-hours
+      - "96"
       - --entry-model
       - /app/data/pattern_entry_regressor/pattern_entry_regressor_v2_2026-01-02T23-51-17Z.joblib
+      - --exit-gap-model
+      - /app/data/exit_oracle/exit_oracle_gap_regressor_hold15_2026-01-03T16-13-20Z.joblib
+      - --exit-gap-tau
+      - "0.10"
+      - --exit-gap-min-exit-k
+      - "2"
       - --hold-min
       - "15"
       - --target-frac
-      - "0.001"
+      - "0.0001"
       - --out-dir
       - /app/data/live_dydx
       - --bank-log
@@ -98,5 +107,11 @@ services:
       - "120"
       - --stall-seconds
       - "300"
+      - --max-prior-scores
+      - "200000"
+      - --min-prior-scores
+      - "2000"
+      - --seed-days
+      - "2"
       - --retention-days
       - "0"

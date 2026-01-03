@@ -10,7 +10,8 @@ Implements the two-subaccount scheme:
 Strategy logic (UPDATED 2026-01-03):
 - Entry model: pattern_entry_regressor_v2 (dYdX-trained) using the same feature engineering as offline training.
 - Entry selection: causal per-day online threshold (quantile of prior scores) targeting --target-frac.
-- Exit: simple fixed hold to --hold-min minutes (no exit model, no policy sweep).
+- Exit (NEW): oracle-gap regressor policy (predict oracle_gap_pct = oracle_ret_pct - ret_if_exit_now_pct).
+  Policy: exit at the first minute k>=min_exit_k where pred_gap_pct <= tau_gap; else force-exit at hold_min.
 
 Notes:
 - Backfill is required so rolling features (incl. 1d z-scores) are defined.
@@ -42,6 +43,31 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 import joblib
 import numpy as np
 import pandas as pd
+
+
+@dataclass
+class ExitGapRegressor:
+    model: Any
+    feature_cols: List[str]
+    artifact: str
+    created_utc: Optional[str]
+
+
+def load_exit_gap_regressor(path: Optional[Path]) -> Optional[ExitGapRegressor]:
+    if path is None:
+        return None
+    p = Path(path)
+    if not str(p).strip():
+        return None
+    obj = joblib.load(p)
+    if not isinstance(obj, dict) or "model" not in obj or "feature_cols" not in obj:
+        raise SystemExit(f"Unexpected exit gap regressor artifact format: {p}")
+    return ExitGapRegressor(
+        model=obj["model"],
+        feature_cols=[str(c) for c in list(obj.get("feature_cols") or [])],
+        artifact=p.name,
+        created_utc=obj.get("created_utc"),
+    )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -75,10 +101,12 @@ def _zscore_roll(s: pd.Series, win: int) -> pd.Series:
     return (s - mu) / (sd + 1e-12)
 
 
-def build_entry_pattern_frame_v2(bars: pd.DataFrame, base_features: List[str]) -> pd.DataFrame:
+def build_entry_pattern_frame_v2(bars: pd.DataFrame, base_features: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build the v2 pattern frame used by pattern_entry_regressor_v2.
 
     Must match scripts/pattern_entry_regressor_oracle_sweep_v2_2026-01-02T23-28-15Z.py.
+
+    Returns (pattern_frame, base_feature_frame_src).
     """
     bars = bars.copy().sort_values("timestamp").reset_index(drop=True)
     bars["ts_min"] = pd.to_datetime(bars["timestamp"]).dt.floor("min")
@@ -152,7 +180,7 @@ def build_entry_pattern_frame_v2(bars: pd.DataFrame, base_features: List[str]) -
     df["flag__ret1m_abs_z_gt3"] = (df["z1d__px_ret1m_abs"] > 3.0).astype(np.float32)
     df["flag__range1m_abs_z_gt3"] = (df["z1d__px_range1m_abs"] > 3.0).astype(np.float32)
 
-    return df
+    return df, src
 
 from dydx_adapter import load_dotenv
 from dydx_adapter.v4 import DydxV4Config, connect_v4, new_client_id, usdc_to_quantums
@@ -998,9 +1026,14 @@ class DydxRunner:
         cfg: DydxV4Config,
         clients,
         loop: asyncio.AbstractEventLoop,
+        exit_gap: Optional[ExitGapRegressor] = None,
+        exit_gap_tau: float = 0.10,
+        exit_gap_min_exit_k: int = 2,
         thresholds_live_out: Optional[Path] = None,
         prior_scores_path: Optional[Path] = None,
         max_prior_scores: int = 200_000,
+        min_prior_scores: int = 2_000,
+        seed_days: int = 2,
         retention_days: int = 0,
         metrics_port: int = 0,
         health_max_staleness_sec: float = 120.0,
@@ -1023,6 +1056,8 @@ class DydxRunner:
         self.thresholds_live_out = Path(thresholds_live_out) if thresholds_live_out else None
         self.prior_scores_path = Path(prior_scores_path) if prior_scores_path else None
         self.max_prior_scores = int(max_prior_scores)
+        self.min_prior_scores = int(min_prior_scores)
+        self.seed_days = int(seed_days)
         self.retention_days = int(retention_days)
 
         self.metrics_port = int(metrics_port)
@@ -1033,8 +1068,13 @@ class DydxRunner:
 
         self.bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])  # closed bars only
         self.feats: Optional[pd.DataFrame] = None
+        self.exit_src: Optional[pd.DataFrame] = None
 
-        # Build features for the union of entry+exit model columns.
+        self.exit_gap = exit_gap
+        self.exit_gap_tau = float(exit_gap_tau)
+        self.exit_gap_min_exit_k = int(exit_gap_min_exit_k)
+
+        # Entry features are built via the pattern v2 frame; legacy exit features are unused in this strategy.
         self._feat_union: List[str] = _union_feature_names(self.models.entry_features, self.models.exit_features)
         req_pre_mins = set(_infer_pre_mins_from_features(self._feat_union))
         for pm in [int(self.models.entry_pre_min), int(self.models.exit_pre_min)]:
@@ -1414,18 +1454,24 @@ class DydxRunner:
     def _entry_threshold_for_day(self, d):
         if d in self.thr_map:
             return self.thr_map[d]
-        if self.prior_scores:
-            q = float(np.quantile(np.array(self.prior_scores, dtype=np.float64), 1.0 - self.target_frac))
-            self.thr_map[d] = q
-            return q
-        return np.inf
+
+        # Match offline/backtest gating: require a minimum sample size before thresholds become active.
+        if not self.prior_scores or int(len(self.prior_scores)) < int(getattr(self, "min_prior_scores", 0) or 0):
+            self.thr_map[d] = float("inf")
+            return self.thr_map[d]
+
+        q = float(np.quantile(np.array(self.prior_scores, dtype=np.float64), 1.0 - self.target_frac))
+        self.thr_map[d] = q
+        return q
 
     def _ensure_feats(self) -> None:
         # For the v2 pattern entry model we build the same derived frame used in training.
+        # Also keep the underlying base feature frame for exit-gap model features.
         try:
-            pat = build_entry_pattern_frame_v2(self.bars, base_features=self.models.entry_base_features)
+            pat, src = build_entry_pattern_frame_v2(self.bars, base_features=self.models.entry_base_features)
         except Exception as e:
             self.feats = None
+            self.exit_src = None
             self._missing_cols = list(self.models.entry_features)
             self._missing_entry_cols = list(self.models.entry_features)
             self._missing_exit_cols = []
@@ -1433,6 +1479,7 @@ class DydxRunner:
             return
 
         self.feats = pat
+        self.exit_src = src
 
         i = len(self.bars) - 1
         # Training required >= 1 day warmup for z1d_* indicators.
@@ -1559,9 +1606,466 @@ class DydxRunner:
         x = self.feats.loc[i, self.models.entry_features].to_numpy(dtype=np.float32)[None, :]
         return float(self.models.entry_model.predict(x)[0])
 
+    # ---- Exit-gap regressor feature engineering (must match oracle-exit dataset builder) ----
+
+    _QE_MODELS: Dict[int, Dict[str, Any]] = {
+        1: {
+            "feature_cols": [
+                "px_range_norm1m__t0",
+                "px_range_norm1m__t1",
+                "range_norm_5m__t1",
+                "range_norm_5m__t2",
+                "range_norm_5m__t0",
+                "macd__t1",
+                "macd__t2",
+                "px_range_norm1m__t2",
+                "macd__t0",
+                "vol_std_5m__t2",
+                "vol_std_5m__t1",
+                "vol_std_5m__t0",
+            ],
+            "mean": [
+                0.0017311684157958627,
+                0.001799022583623574,
+                0.005201049404186999,
+                0.005219247844162671,
+                0.00508836013540689,
+                -14.8716822745053,
+                -12.901003073577206,
+                0.0022877535369816705,
+                -15.30467478596776,
+                97.63208412551606,
+                98.8282850808809,
+                94.23914311794302,
+            ],
+            "std": [
+                0.002151103248995944,
+                0.0019385443943925737,
+                0.004336551503240184,
+                0.004265534481971351,
+                0.004291754603747401,
+                136.32319643938536,
+                133.23070322665765,
+                0.0023559100334701955,
+                138.63555088715978,
+                81.06773524775568,
+                82.59282483228851,
+                87.7748030360668,
+            ],
+            "coef": [
+                0.49821968896154567,
+                0.3006536977305254,
+                -0.03390883350241022,
+                0.5491694390310403,
+                -0.45858960448213576,
+                -2.6440024697146813,
+                1.2525218690586208,
+                -0.131773273835023,
+                1.2307795942830244,
+                0.10173026078095815,
+                0.18957380910723812,
+                -0.24169722702957883,
+            ],
+            "intercept": -0.1262394305926545,
+        },
+        2: {
+            "feature_cols": [
+                "px_range_norm1m__t0",
+                "px_range_norm1m__t1",
+                "px_range_norm1m__t2",
+                "range_norm_5m__t0",
+                "range_norm_5m__t2",
+                "range_norm_5m__t1",
+                "vol_std_5m__t0",
+                "macd__t2",
+                "macd__t0",
+                "macd__t1",
+                "vol_std_5m__t2",
+                "ind_neg",
+            ],
+            "mean": [
+                0.0016825148751894745,
+                0.0017311684157958627,
+                0.001799022583623574,
+                0.004911417996101815,
+                0.005201049404186999,
+                0.00508836013540689,
+                85.41860345222413,
+                -14.8716822745053,
+                -14.54825509941764,
+                -15.30467478596776,
+                98.8282850808809,
+                0.8437762536470834,
+            ],
+            "std": [
+                0.002123881519424586,
+                0.002151103248995944,
+                0.0019385443943925737,
+                0.004064453432659976,
+                0.004336551503240184,
+                0.004291754603747401,
+                80.48006440317958,
+                136.32319643938536,
+                140.7627165829248,
+                138.63555088715978,
+                82.59282483228851,
+                0.19991236876880172,
+            ],
+            "coef": [
+                0.6610773181013107,
+                0.5090862733850794,
+                0.0669961618758457,
+                -0.20776535018127928,
+                0.5524467593663873,
+                -0.5082489258371796,
+                -0.04332494043509365,
+                -1.6320144354352097,
+                -1.850280060153793,
+                3.2809397222096,
+                0.08757782979542733,
+                -0.07500164742692321,
+            ],
+            "intercept": -0.15862642859705967,
+        },
+        3: {
+            "feature_cols": [
+                "px_range_norm1m__t0",
+                "px_range_norm1m__t1",
+                "px_range_norm1m__t2",
+                "drawdown_from_peak_pct",
+                "range_norm_5m__t0",
+                "vol_std_5m__t0",
+                "range_norm_5m__t1",
+                "range_norm_5m__t2",
+                "delta_mark_change_2m",
+                "vol_std_5m__t1",
+                "ind_neg",
+                "macd__t0",
+            ],
+            "mean": [
+                0.0016334127545820165,
+                0.0016825148751894745,
+                0.0017311684157958627,
+                -0.07294866189946678,
+                0.004648579939007556,
+                76.93326570808777,
+                0.004911417996101815,
+                0.00508836013540689,
+                0.025025398578561613,
+                85.41860345222413,
+                0.8400210779410251,
+                -13.219567950278769,
+            ],
+            "std": [
+                0.001807875565210792,
+                0.002123881519424586,
+                0.002151103248995944,
+                0.1287983162431893,
+                0.0038768760588339408,
+                73.64706830374843,
+                0.004064453432659976,
+                0.004291754603747401,
+                0.21642660549499265,
+                80.48006440317958,
+                0.20381119533910882,
+                142.51396637646718,
+            ],
+            "coef": [
+                0.3531046695830277,
+                0.28924432342328393,
+                0.2985978304067285,
+                -0.6468089689196372,
+                -0.4753901879792831,
+                0.298650559259968,
+                0.13419032645676224,
+                0.14406811962902843,
+                0.1220210049887942,
+                -0.2589707005521335,
+                -0.08416181521140421,
+                -0.1603943555151908,
+            ],
+            "intercept": -0.2709326807596019,
+        },
+    }
+
+    @staticmethod
+    def _sigmoid_scalar(x: float) -> float:
+        x = float(np.clip(float(x), -20.0, 20.0))
+        return float(1.0 / (1.0 + np.exp(-x)))
+
+    @staticmethod
+    def _zscore_roll_series(s: pd.Series, win: int) -> pd.Series:
+        mu = s.rolling(int(win), min_periods=int(win)).mean()
+        sd = s.rolling(int(win), min_periods=int(win)).std()
+        return (s - mu) / (sd + 1e-12)
+
+    def _compute_ind_pos_neg_at(self, idx: int) -> Tuple[float, float]:
+        if self.exit_src is None or self.bars is None or len(self.bars) == 0:
+            return float("nan"), float("nan")
+
+        close = pd.to_numeric(self.bars["close"], errors="coerce")
+        high = pd.to_numeric(self.bars["high"], errors="coerce")
+        low = pd.to_numeric(self.bars["low"], errors="coerce")
+
+        px_ret1m = close.pct_change() * 100.0
+        px_range1m = (high - low) / (close + 1e-12)
+
+        pre_ret_15m = close.pct_change(15) * 100.0
+        pre_range_15m = (high.rolling(15, min_periods=15).max() / (low.rolling(15, min_periods=15).min() + 1e-12)) - 1.0
+        pre_vol_15m = px_ret1m.rolling(15, min_periods=15).std()
+        pre_absret_max_15m = px_ret1m.abs().rolling(15, min_periods=15).max()
+
+        vol5 = px_ret1m.rolling(5, min_periods=5).std()
+
+        z1d_vol5 = self._zscore_roll_series(vol5, 1440)
+        z1d_ret1m_abs = self._zscore_roll_series(px_ret1m, 1440).abs()
+        z1d_range1m_abs = self._zscore_roll_series(px_range1m, 1440).abs()
+
+        dip1m = (-px_ret1m).clip(lower=0.0)
+        z_dip1m = self._zscore_roll_series(dip1m, 1440)
+        z_pre_vol_15m = self._zscore_roll_series(pre_vol_15m, 1440)
+        z_pre_range_15m = self._zscore_roll_series(pre_range_15m, 1440)
+        z_pre_absret_max_15m = self._zscore_roll_series(pre_absret_max_15m, 1440)
+        down15 = (-pre_ret_15m).clip(lower=0.0)
+        z_down15 = self._zscore_roll_series(down15, 1440)
+
+        mom5 = pd.to_numeric(self.exit_src.get("mom_5m_pct"), errors="coerce") if "mom_5m_pct" in self.exit_src.columns else pd.Series([np.nan] * len(self.exit_src))
+        z_mom5 = self._zscore_roll_series(mom5, 1440)
+
+        try:
+            pos_raw = (
+                0.80 * float(z_mom5.iloc[idx])
+                + 0.60 * float(z_dip1m.iloc[idx])
+                + 0.40 * float(z_pre_vol_15m.iloc[idx])
+                + 0.20 * float(z_pre_range_15m.iloc[idx])
+                - 0.80 * float(z1d_vol5.iloc[idx])
+                - 0.60 * float(z1d_range1m_abs.iloc[idx])
+            )
+            neg_raw = (
+                0.90 * float(z1d_vol5.iloc[idx])
+                + 0.80 * float(z1d_range1m_abs.iloc[idx])
+                + 0.60 * float(z1d_ret1m_abs.iloc[idx])
+                + 0.40 * float(z_pre_range_15m.iloc[idx])
+                + 0.40 * float(z_pre_absret_max_15m.iloc[idx])
+                + 0.40 * float(z_down15.iloc[idx])
+            )
+        except Exception:
+            return float("nan"), float("nan")
+
+        ind_pos = self._sigmoid_scalar(pos_raw)
+        ind_neg = self._sigmoid_scalar(neg_raw)
+        return float(ind_pos), float(ind_neg)
+
+    def _qe_feat_value(
+        self,
+        feat_name: str,
+        *,
+        decision_i: int,
+        cur_ret: float,
+        r_prev1: float,
+        r_prev2: float,
+        peak_ret: float,
+        ind_neg: float,
+    ) -> float:
+        # lagged feature name form: "base__t{lag}"
+        if "__t" in feat_name:
+            base, suf = feat_name.rsplit("__", 1)
+            try:
+                lag = int(suf[1:])
+            except Exception:
+                lag = 0
+            j = int(decision_i) - int(lag)
+            if j < 0 or j >= len(self.bars):
+                return float("nan")
+
+            if base == "px_range_norm1m":
+                c = float(self.bars.iloc[j]["close"])
+                h = float(self.bars.iloc[j]["high"])
+                l = float(self.bars.iloc[j]["low"])
+                return float((h - l) / (c + 1e-12))
+
+            if self.exit_src is None:
+                return float("nan")
+
+            arr = self.exit_src.get(str(base))
+            if arr is None:
+                return float("nan")
+            try:
+                return float(pd.to_numeric(arr, errors="coerce").to_numpy(np.float64)[j])
+            except Exception:
+                return float("nan")
+
+        if feat_name == "drawdown_from_peak_pct":
+            return float(cur_ret - peak_ret)
+        if feat_name == "delta_mark_change_2m":
+            return float(cur_ret - r_prev2) if np.isfinite(r_prev2) else float("nan")
+        if feat_name == "delta_mark_change_1m":
+            return float(cur_ret - r_prev1) if np.isfinite(r_prev1) else float("nan")
+        if feat_name == "ind_neg":
+            return float(ind_neg)
+
+        return float("nan")
+
+    def _compute_ind_quick_exit_3m(self, *, mins_in_trade: int, decision_i: int, cur_ret: float, r_prev1: float, r_prev2: float, peak_ret: float, ind_neg: float) -> float:
+        k = int(mins_in_trade)
+        if k not in (1, 2, 3):
+            return float("nan")
+        m = self._QE_MODELS.get(k)
+        if m is None:
+            return float("nan")
+
+        feats = list(m["feature_cols"])
+        mu = np.asarray(m["mean"], dtype=np.float64)
+        sd = np.asarray(m["std"], dtype=np.float64)
+        coef = np.asarray(m["coef"], dtype=np.float64)
+        intercept = float(m["intercept"])
+
+        x = np.asarray(
+            [
+                self._qe_feat_value(
+                    str(fn),
+                    decision_i=int(decision_i),
+                    cur_ret=float(cur_ret),
+                    r_prev1=float(r_prev1),
+                    r_prev2=float(r_prev2),
+                    peak_ret=float(peak_ret),
+                    ind_neg=float(ind_neg),
+                )
+                for fn in feats
+            ],
+            dtype=np.float64,
+        )
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        xz = (x - mu) / (sd + 1e-12)
+        logit = intercept + float(np.dot(coef, xz))
+        return float(self._sigmoid_scalar(logit))
+
+    def _exit_gap_features_for_decision(
+        self,
+        *,
+        decision_i: int,
+        mins_in_trade: int,
+        entry_px: float,
+        cur_ret: float,
+        r_prev1: float,
+        r_prev2: float,
+        r_prev3: float,
+        peak_ret: float,
+    ) -> np.ndarray:
+        # Build values in the exact order required by the model artifact.
+        if self.exit_gap is None:
+            return np.zeros((0,), dtype=np.float32)
+
+        hold_min = int(self.hold_min)
+
+        # price-derived arrays for lags
+        close = pd.to_numeric(self.bars["close"], errors="coerce")
+        high = pd.to_numeric(self.bars["high"], errors="coerce")
+        low = pd.to_numeric(self.bars["low"], errors="coerce")
+        px_ret1m = (close.pct_change() * 100.0).to_numpy(np.float64)
+        px_range1m = ((high - low) / (close + 1e-12)).to_numpy(np.float64)
+
+        ind_pos, ind_neg = self._compute_ind_pos_neg_at(int(decision_i))
+        ind_qe = self._compute_ind_quick_exit_3m(
+            mins_in_trade=int(mins_in_trade),
+            decision_i=int(decision_i),
+            cur_ret=float(cur_ret),
+            r_prev1=float(r_prev1),
+            r_prev2=float(r_prev2),
+            peak_ret=float(peak_ret),
+            ind_neg=float(ind_neg),
+        )
+
+        def _get_base_feat(base: str, j: int) -> float:
+            if self.exit_src is None:
+                return float("nan")
+            if str(base) not in self.exit_src.columns:
+                return float("nan")
+            try:
+                arr = pd.to_numeric(self.exit_src[str(base)], errors="coerce").to_numpy(np.float64)
+                return float(arr[j])
+            except Exception:
+                return float("nan")
+
+        out: List[float] = []
+        for c in self.exit_gap.feature_cols:
+            if c == "mins_in_trade":
+                out.append(float(mins_in_trade))
+                continue
+            if c == "mins_remaining":
+                out.append(float(max(0, hold_min - int(mins_in_trade))))
+                continue
+            if c == "delta_mark_pct":
+                out.append(float(cur_ret))
+                continue
+            if c == "delta_mark_prev1_pct":
+                out.append(float(r_prev1))
+                continue
+            if c == "delta_mark_prev2_pct":
+                out.append(float(r_prev2))
+                continue
+            if c == "delta_mark_change_1m":
+                out.append(float(cur_ret - r_prev1) if np.isfinite(r_prev1) else float("nan"))
+                continue
+            if c == "delta_mark_change_2m":
+                out.append(float(cur_ret - r_prev2) if np.isfinite(r_prev2) else float("nan"))
+                continue
+            if c == "delta_mark_change_3m":
+                out.append(float(cur_ret - r_prev3) if np.isfinite(r_prev3) else float("nan"))
+                continue
+            if c == "drawdown_from_peak_pct":
+                out.append(float(cur_ret - peak_ret))
+                continue
+
+            if c.startswith("px_ret1m_close__t"):
+                try:
+                    lag = int(c.split("__t", 1)[1])
+                except Exception:
+                    lag = 0
+                j = int(decision_i) - int(lag)
+                out.append(float(px_ret1m[j]) if j >= 0 else float("nan"))
+                continue
+            if c.startswith("px_range_norm1m__t"):
+                try:
+                    lag = int(c.split("__t", 1)[1])
+                except Exception:
+                    lag = 0
+                j = int(decision_i) - int(lag)
+                out.append(float(px_range1m[j]) if j >= 0 else float("nan"))
+                continue
+
+            if c == "ind_pos":
+                out.append(float(ind_pos))
+                continue
+            if c == "ind_neg":
+                out.append(float(ind_neg))
+                continue
+            if c == "ind_quick_exit_3m":
+                out.append(float(ind_qe))
+                continue
+
+            # base feature lags: e.g. macd__t0
+            if "__t" in c:
+                base, suf = c.rsplit("__", 1)
+                try:
+                    lag = int(suf[1:])
+                except Exception:
+                    lag = 0
+                j = int(decision_i) - int(lag)
+                if j < 0:
+                    out.append(float("nan"))
+                else:
+                    out.append(float(_get_base_feat(str(base), int(j))))
+                continue
+
+            # fallback: unknown feature
+            out.append(float("nan"))
+
+        return np.asarray(out, dtype=np.float32)
+
     def _predict_exit_index(self, i: int) -> float:
-        # Exit model disabled in fixed-hold mode.
-        raise RuntimeError("Exit model disabled")
+        # Legacy exit model not used in this strategy.
+        raise RuntimeError("Legacy exit model disabled")
 
     async def _open_real_long(self, *, equity_before: float) -> Dict[str, Any]:
         mk = await _fetch_market_meta(self.clients, self.market)
@@ -1820,7 +2324,49 @@ class DydxRunner:
             "fill_assumed": bool(fill_assumed),
         }
 
-    def on_closed_bar(self, bar: Mapping[str, Any]) -> None:
+    def _rest_fetch_1m_bars(self, *, start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> List[Dict[str, Any]]:
+        """Fetch CLOSED 1m bars from indexer REST (best-effort), returns list sorted by timestamp ascending."""
+        s = pd.to_datetime(start_utc, utc=True)
+        e = pd.to_datetime(end_utc, utc=True)
+        if e < s:
+            return []
+
+        try:
+            resp = self.loop.run_until_complete(
+                self.clients.indexer.markets.get_perpetual_market_candles(
+                    market=str(self.market),
+                    resolution="1MIN",
+                    from_iso=s.to_pydatetime().isoformat().replace("+00:00", "Z"),
+                    to_iso=e.to_pydatetime().isoformat().replace("+00:00", "Z"),
+                    limit=1000,
+                )
+            )
+        except Exception as ex:
+            self._alert("rest_backfill_failed", "REST backfill failed", error=str(ex))
+            return []
+
+        candles = resp.get("candles") if isinstance(resp, dict) else None
+        if not isinstance(candles, list) or not candles:
+            return []
+
+        df = pd.DataFrame(candles)
+        if df.empty:
+            return []
+
+        df["timestamp"] = pd.to_datetime(df["startedAt"], utc=True)
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["baseTokenVolume"].astype(float)
+
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        df = df[(df["timestamp"] >= s) & (df["timestamp"] <= e)].copy()
+
+        return df.to_dict("records")
+
+    def on_closed_bar(self, bar: Mapping[str, Any], *, allow_trade_logic: bool = True) -> None:
         # Feed heartbeat (used by /health and stall watchdog).
         self.last_closed_wall = time.time()
 
@@ -1844,6 +2390,39 @@ class DydxRunner:
                 self.bars.iloc[-1] = pd.Series(row)
                 return
 
+            # If we detect gaps, backfill missing bars via REST before proceeding.
+            # This keeps feature computation consistent and avoids "missing minute" drift.
+            dt = ts - prev_ts
+            if dt > timedelta(minutes=1):
+                gap_mins = int(dt.total_seconds() // 60) - 1
+                self._alert(
+                    "bar_gap",
+                    "Detected missing 1m bars; attempting REST backfill",
+                    prev_ts=str(prev_ts),
+                    ts=str(ts),
+                    gap_mins=int(gap_mins),
+                )
+
+                if self.bank_log is not None:
+                    try:
+                        self._bank_snapshot(
+                            "bar_gap_detected",
+                            {"prev_ts": str(prev_ts), "ts": str(ts), "gap_mins": int(gap_mins)},
+                        )
+                    except Exception:
+                        pass
+
+                # Backfill the strictly missing interval.
+                bf_start = prev_ts + timedelta(minutes=1)
+                bf_end = ts - timedelta(minutes=1)
+                missing_rows = self._rest_fetch_1m_bars(start_utc=bf_start, end_utc=bf_end)
+                for r in missing_rows:
+                    try:
+                        self.on_closed_bar(r, allow_trade_logic=False)
+                    except Exception:
+                        # best effort
+                        pass
+
         self.bars = pd.concat([self.bars, pd.DataFrame([row])], ignore_index=True)
         self._persist_bar(row)
         self._audit_market_bar_1m_closed(row)
@@ -1857,20 +2436,62 @@ class DydxRunner:
 
         if self.cur_day is None:
             self.cur_day = d
-            # Seed scores for prior days from existing backfill (entry model only).
-            # Keep it consistent with training: require warmup + finite feature rows.
-            if self.feats is not None and len(self.feats) > 0 and not self._missing_entry_cols:
+
+            # If we don't have persisted prior scores yet, seed them from the initial backfill so
+            # the live threshold distribution matches the offline/backtest logic as closely as possible.
+            if (not self.prior_scores) and self.feats is not None and len(self.feats) > 0 and not self._missing_entry_cols:
                 try:
                     X_df = self.feats[self.models.entry_features]
                     good = np.isfinite(X_df.to_numpy(np.float64)).all(axis=1)
                     good &= (np.arange(len(X_df), dtype=np.int64) >= 1440)
 
                     if np.any(good):
-                        scores = self.models.entry_model.predict(X_df.iloc[np.where(good)[0]].to_numpy(dtype=np.float32))
-                        df_scores = pd.DataFrame({"timestamp": self.feats.loc[np.where(good)[0], "timestamp"], "score": scores})
+                        idxs = np.where(good)[0]
+                        scores = self.models.entry_model.predict(X_df.iloc[idxs].to_numpy(dtype=np.float32))
+                        df_scores = pd.DataFrame({"timestamp": self.feats.loc[idxs, "timestamp"], "score": scores})
+                        df_scores["timestamp"] = pd.to_datetime(df_scores["timestamp"], utc=True)
                         df_scores["date"] = pd.to_datetime(df_scores["timestamp"]).dt.date
-                        prior = df_scores[df_scores["date"] < d]["score"].tolist()
-                        self.prior_scores.extend([float(x) for x in prior])
+                        df_scores = df_scores.sort_values("timestamp").reset_index(drop=True)
+
+                        # Seed-day logic: fill prior_scores with the first N days in the backfill.
+                        days = []
+                        seen = set()
+                        for x in df_scores["date"].tolist():
+                            if x not in seen:
+                                seen.add(x)
+                                days.append(x)
+
+                        seed_n = max(0, int(getattr(self, "seed_days", 0) or 0))
+
+                        # Preferred: strict seed-days logic (matches offline scripts).
+                        if seed_n > 0 and len(days) > seed_n:
+                            seed_set = set(days[:seed_n])
+                            prior0 = df_scores[df_scores["date"].isin(seed_set)]["score"].to_numpy(np.float64)
+                            self.prior_scores.extend([float(x) for x in prior0 if np.isfinite(float(x))])
+
+                            # Walk remaining days up to today to keep day boundaries causal.
+                            for day in days[seed_n:]:
+                                if day >= d:
+                                    break
+                                day_scores = df_scores[df_scores["date"] == day]["score"].to_numpy(np.float64)
+                                if len(self.prior_scores) >= int(self.min_prior_scores):
+                                    self.thr_map[day] = float(np.quantile(np.asarray(self.prior_scores, dtype=np.float64), 1.0 - self.target_frac))
+                                self.prior_scores.extend([float(x) for x in day_scores if np.isfinite(float(x))])
+                                self._cap_prior_scores()
+
+                            # Seed today's already-seen scores into _scores_cur_day so tomorrow's threshold matches
+                            # what it would have been if the bot ran from midnight.
+                            todays = df_scores[df_scores["date"] == d]["score"].to_numpy(np.float64)
+                            self._scores_cur_day.extend([float(x) for x in todays if np.isfinite(float(x))])
+
+                        # Fallback: if the backfill window doesn't span enough days to satisfy seed_n,
+                        # still seed from *prior-day* scores (no leakage) so we can trade today.
+                        elif len(days) >= 1:
+                            prior_any = df_scores[df_scores["date"] < d]["score"].to_numpy(np.float64)
+                            self.prior_scores.extend([float(x) for x in prior_any if np.isfinite(float(x))])
+                            todays = df_scores[df_scores["date"] == d]["score"].to_numpy(np.float64)
+                            self._scores_cur_day.extend([float(x) for x in todays if np.isfinite(float(x))])
+
                 except Exception:
                     pass
 
@@ -1879,6 +2500,12 @@ class DydxRunner:
             try:
                 thr0 = float(self._entry_threshold_for_day(d))
                 self._append_threshold(d, thr0)
+            except Exception:
+                pass
+
+            # Persist seeded state so restarts preserve parity.
+            try:
+                self._save_prior_scores()
             except Exception:
                 pass
 
@@ -1918,7 +2545,7 @@ class DydxRunner:
                     pass
 
         # Real-mode reconciliation: ensure we never trade with an orphaned open position.
-        if str(self.trade_mode).lower() == "real":
+        if bool(allow_trade_logic) and str(self.trade_mode).lower() == "real":
             live_sz = self._safe_get_live_position_size_btc()
             if live_sz is not None:
                 live_abs = abs(float(live_sz))
@@ -2081,7 +2708,8 @@ class DydxRunner:
         ready_for_new_entries = (not self._missing_entry_cols)
 
         if (
-            ready_for_new_entries
+            bool(allow_trade_logic)
+            and ready_for_new_entries
             and score_i is not None
             and np.isfinite(score_i)
             and score_i >= thr
@@ -2254,6 +2882,10 @@ class DydxRunner:
                                 "models": {
                                     "entry_artifact": str(self.models.entry_artifact),
                                     "exit_artifact": str(self.models.exit_artifact),
+                                    "exit_gap_artifact": (str(self.exit_gap.artifact) if self.exit_gap is not None else None),
+                                    "exit_gap_created_utc": (str(self.exit_gap.created_utc) if self.exit_gap is not None else None),
+                                    "exit_gap_tau": (float(self.exit_gap_tau) if self.exit_gap is not None else None),
+                                    "exit_gap_min_exit_k": (int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None),
                                 },
                                 "balances": {
                                     "trading_equity_before_usdc": float(equity_before),
@@ -2274,6 +2906,8 @@ class DydxRunner:
 
 
         # Progress open trade
+        if not bool(allow_trade_logic):
+            return
         if self.open_trade is None:
             return
 
@@ -2292,14 +2926,66 @@ class DydxRunner:
         k_rel = int(i - j0)
         if k_rel <= 0:
             return
-        # Fixed-hold exit: close after hold_min minutes.
+        # Exit policy: oracle-gap regressor (if configured), else fixed-hold.
         hold_min = int(getattr(self, "hold_min", 15))
 
         # Cap k_rel for reporting.
         if k_rel > int(hold_min):
             k_rel = int(hold_min)
 
-        if int(k_rel) >= int(hold_min):
+        pred_gap: Optional[float] = None
+        exit_reason = ""
+
+        if self.exit_gap is not None and self.exit_src is not None:
+            # Initialize per-trade state
+            if "ret_hist" not in tr:
+                tr["ret_hist"] = []
+                tr["peak_ret"] = -1e30
+
+            entry_px = float(tr.get("entry_open") or 0.0)
+            cur_px = float(self.bars.iloc[i]["close"])
+            cur_ret = float(net_return_pct(entry_px, cur_px, float(self.cfg.fee_side)))
+
+            # update peak (as in dataset builder: peak includes current, then drawdown <= 0)
+            tr["peak_ret"] = float(max(float(tr.get("peak_ret") or -1e30), cur_ret))
+            peak_ret = float(tr.get("peak_ret") or cur_ret)
+
+            # update return history
+            tr["ret_hist"].append(float(cur_ret))
+            r_prev1 = float(tr["ret_hist"][-2]) if len(tr["ret_hist"]) >= 2 else float("nan")
+            r_prev2 = float(tr["ret_hist"][-3]) if len(tr["ret_hist"]) >= 3 else float("nan")
+            r_prev3 = float(tr["ret_hist"][-4]) if len(tr["ret_hist"]) >= 4 else float("nan")
+
+            # compute per-feature vector for this decision
+            x_row = self._exit_gap_features_for_decision(
+                decision_i=int(i),
+                mins_in_trade=int(k_rel),
+                entry_px=float(entry_px),
+                cur_ret=float(cur_ret),
+                r_prev1=r_prev1,
+                r_prev2=r_prev2,
+                r_prev3=r_prev3,
+                peak_ret=float(peak_ret),
+            )
+
+            try:
+                pred_gap = float(self.exit_gap.model.predict(np.asarray([x_row], dtype=np.float32))[0])
+            except Exception:
+                pred_gap = None
+
+            # decide exit
+            if int(k_rel) >= int(hold_min):
+                exit_reason = "hold_min"
+            elif int(k_rel) >= int(self.exit_gap_min_exit_k) and pred_gap is not None and np.isfinite(pred_gap) and float(pred_gap) <= float(self.exit_gap_tau):
+                exit_reason = "pred_gap<=tau"
+
+            tr["exit_pred_gap_pct_last"] = pred_gap
+            tr["exit_reason_last"] = exit_reason
+        else:
+            if int(k_rel) >= int(hold_min):
+                exit_reason = "hold_min"
+
+        if exit_reason:
             exit_k = int(k_rel)
             exit_time = ts + timedelta(minutes=1)
             pred = None
@@ -2312,7 +2998,10 @@ class DydxRunner:
                         {
                             "trade_id": str(tr.get("trade_id") or ""),
                             "exit_rel_min": int(exit_k),
-                            "exit_predicted_ret_pct": _finite_or_none(pred),
+                            "exit_reason": str(exit_reason),
+                            "exit_pred_gap_pct": _finite_or_none(pred_gap),
+                            "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                            "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
                         },
                     )
                 except Exception:
@@ -2340,6 +3029,10 @@ class DydxRunner:
                         "exit_fill_time_utc": _iso_utc(exit_time),
                         "entry_fill_latency_s": None,
                         "exit_fill_latency_s": None,
+                        "exit_reason": str(exit_reason),
+                        "exit_pred_gap_pct": _finite_or_none(pred_gap),
+                        "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                        "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
                     },
                 )
 
@@ -2354,6 +3047,10 @@ class DydxRunner:
                         "entry_fill_latency_s": None,
                         "exit_fill_latency_s": None,
                         "exit_rel_min": int(exit_k),
+                        "exit_reason": str(exit_reason),
+                        "exit_pred_gap_pct": _finite_or_none(pred_gap),
+                        "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                        "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
                         "predicted_ret_pct": pred,
                         "realized_ret_pct": float(realized),
                     }
@@ -2484,6 +3181,8 @@ class DydxRunner:
                 )
             )
             realized_assumed_fee = float(net_return_pct(entry_fill_px, exit_fill_px, float(self.cfg.fee_side)))
+            exit_pred_gap_pct = _finite_or_none(tr.get("exit_pred_gap_pct_last"))
+            exit_reason = str(tr.get("exit_reason_last") or "")
 
             entry_fill_latency_s: Optional[float] = None
             exit_fill_latency_s: Optional[float] = None
@@ -2576,7 +3275,10 @@ class DydxRunner:
                         "signals": {
                             "entry_score": _finite_or_none(tr.get("entry_score")),
                             "entry_threshold": _finite_or_none(tr.get("entry_threshold")),
-                            "exit_predicted_ret_pct": _finite_or_none(pred),
+                            "exit_pred_gap_pct": exit_pred_gap_pct,
+                            "exit_reason": str(exit_reason),
+                            "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                            "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
                             "exit_rel_min": int(exit_k),
                         },
                         "fees": {"entry_fee_usdc": float(entry_fee), "exit_fee_usdc": float(exit_fee)},
@@ -2638,6 +3340,16 @@ class DydxRunner:
                 except Exception as e:
                     print("Bank log write failed:", e)
 
+            extra = dict(extra)
+            extra.update(
+                {
+                    "exit_reason": str(exit_reason),
+                    "exit_pred_gap_pct": exit_pred_gap_pct,
+                    "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                    "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
+                }
+            )
+
             self._audit_trade_closed(
                 paper=False,
                 entry_time_utc=_iso_utc(tr.get("entry_time")),
@@ -2663,6 +3375,10 @@ class DydxRunner:
                     "entry_fill_latency_s": _finite_or_none(entry_fill_latency_s),
                     "exit_fill_latency_s": _finite_or_none(exit_fill_latency_s),
                     "exit_rel_min": int(exit_k),
+                    "exit_reason": str(exit_reason),
+                    "exit_pred_gap_pct": exit_pred_gap_pct,
+                    "exit_gap_tau": float(self.exit_gap_tau) if self.exit_gap is not None else None,
+                    "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k) if self.exit_gap is not None else None,
                     "predicted_ret_pct": pred,
                     "realized_ret_pct": float(realized_assumed_fee),
                     "realized_ret_pct_fill": float(realized_fill),
@@ -2873,13 +3589,30 @@ def main() -> None:
     )
 
     ap.add_argument("--market", default=os.getenv("DYDX_MARKET", "BTC-USD"))
-    ap.add_argument("--target-frac", type=float, default=0.001)
+    ap.add_argument("--target-frac", type=float, default=0.0001, help="Entry take fraction (0.0001=0.01%%, 0.001=0.1%%)")
     ap.add_argument("--hold-min", type=int, default=15)
+
+    ap.add_argument(
+        "--exit-gap-model",
+        default="",
+        help="Optional oracle-gap regressor artifact (joblib dict with keys: model, feature_cols).",
+    )
+    ap.add_argument("--exit-gap-tau", type=float, default=0.10, help="Exit when pred_gap_pct <= this (pct points)")
+    ap.add_argument("--exit-gap-min-exit-k", type=int, default=2, help="Do not exit before this minute-in-trade")
 
     ap.add_argument("--trade-mode", choices=["paper", "real"], default="paper")
     ap.add_argument("--yes-really", action="store_true", help="Required for --trade-mode real")
 
     ap.add_argument("--backfill-hours", type=int, default=48)
+
+    # Offline replay mode: feed bars from CSV instead of WS/REST.
+    ap.add_argument(
+        "--replay-csv",
+        default="",
+        help="If set, replay closed 1m bars from this CSV (expects timestamp/open/high/low/close/volume). Only supported in --trade-mode paper.",
+    )
+    ap.add_argument("--replay-max-bars", type=int, default=0, help="If >0, only replay the first N bars (debug)")
+    ap.add_argument("--replay-sleep-sec", type=float, default=0.0, help="If >0, sleep between replayed bars")
     ap.add_argument("--thresholds-csv", default="", help="Optional seed thresholds CSV (date, threshold)")
 
     ap.add_argument("--out-dir", default=str(REPO_ROOT / "data" / "live_dydx"))
@@ -2933,6 +3666,18 @@ def main() -> None:
         help="Max number of prior entry scores to keep persisted (rolling window)",
     )
     ap.add_argument(
+        "--min-prior-scores",
+        type=int,
+        default=2000,
+        help="Require at least this many prior scores before enabling thresholds (else threshold=+inf)",
+    )
+    ap.add_argument(
+        "--seed-days",
+        type=int,
+        default=2,
+        help="On startup (if no prior_scores.json), seed prior score pool from this many backfill days",
+    )
+    ap.add_argument(
         "--retention-days",
         type=int,
         default=0,
@@ -2949,6 +3694,9 @@ def main() -> None:
 
     exit_path = Path(args.exit_model) if str(args.exit_model).strip() else None
     models = load_models(Path(args.entry_model), exit_path)
+
+    exit_gap_path = Path(args.exit_gap_model) if str(getattr(args, "exit_gap_model", "")).strip() else None
+    exit_gap = load_exit_gap_regressor(exit_gap_path)
 
     out_dir = Path(args.out_dir)
 
@@ -3017,6 +3765,13 @@ def main() -> None:
                                 "created_utc": models.exit_created_utc,
                                 "n_features": len(models.exit_features),
                             },
+                            "exit_gap": {
+                                "artifact": (exit_gap.artifact if exit_gap is not None else None),
+                                "created_utc": (exit_gap.created_utc if exit_gap is not None else None),
+                                "n_features": (len(exit_gap.feature_cols) if exit_gap is not None else 0),
+                                "tau": (float(getattr(args, "exit_gap_tau", 0.10)) if exit_gap is not None else None),
+                                "min_exit_k": (int(getattr(args, "exit_gap_min_exit_k", 2)) if exit_gap is not None else None),
+                            },
                             "pre_min": int(models.pre_min),
                             "entry_pre_min": int(models.entry_pre_min),
                             "exit_pre_min": int(models.exit_pre_min),
@@ -3051,6 +3806,13 @@ def main() -> None:
                                 "created_utc": models.exit_created_utc,
                                 "n_features": len(models.exit_features),
                             },
+                            "exit_gap": {
+                                "artifact": (exit_gap.artifact if exit_gap is not None else None),
+                                "created_utc": (exit_gap.created_utc if exit_gap is not None else None),
+                                "n_features": (len(exit_gap.feature_cols) if exit_gap is not None else 0),
+                                "tau": (float(getattr(args, "exit_gap_tau", 0.10)) if exit_gap is not None else None),
+                                "min_exit_k": (int(getattr(args, "exit_gap_min_exit_k", 2)) if exit_gap is not None else None),
+                            },
                             "pre_min": int(models.pre_min),
                             "entry_pre_min": int(models.entry_pre_min),
                             "exit_pre_min": int(models.exit_pre_min),
@@ -3078,17 +3840,22 @@ def main() -> None:
                 trade_mode=str(args.trade_mode),
                 backfill_hours=int(args.backfill_hours),
                 thresholds_csv=thresholds_csv,
-                thresholds_live_out=thresholds_live_out,
-                prior_scores_path=prior_scores_path,
-                max_prior_scores=int(args.max_prior_scores),
-                retention_days=int(args.retention_days),
-                metrics_port=int(args.metrics_port),
-                health_max_staleness_sec=float(args.health_max_staleness_sec),
                 audit=audit,
                 bank_log=bank_log,
                 cfg=cfg,
                 clients=clients,
                 loop=loop,
+                exit_gap=exit_gap,
+                exit_gap_tau=float(getattr(args, "exit_gap_tau", 0.10)),
+                exit_gap_min_exit_k=int(getattr(args, "exit_gap_min_exit_k", 2)),
+                thresholds_live_out=thresholds_live_out,
+                prior_scores_path=prior_scores_path,
+                max_prior_scores=int(args.max_prior_scores),
+                min_prior_scores=int(getattr(args, "min_prior_scores", 2000)),
+                seed_days=int(getattr(args, "seed_days", 2)),
+                retention_days=int(args.retention_days),
+                metrics_port=int(args.metrics_port),
+                health_max_staleness_sec=float(args.health_max_staleness_sec),
             )
 
             # Start health/metrics server (optional)
@@ -3105,6 +3872,80 @@ def main() -> None:
             # Safety: on startup in real mode, flatten any leftover position.
             if str(args.trade_mode).lower() == "real":
                 runner.reconcile_startup()
+
+            replay_csv = str(getattr(args, "replay_csv", "") or "").strip()
+            if replay_csv:
+                # Replay is meant for maximum parity testing without relying on WS.
+                if str(args.trade_mode).lower() != "paper":
+                    raise SystemExit("--replay-csv is only supported with --trade-mode paper")
+
+                p = Path(replay_csv)
+                if not p.exists():
+                    raise SystemExit(f"replay csv not found: {p}")
+
+                df = pd.read_csv(p)
+                # Accept either 'timestamp' or dYdX-style 'startedAt'
+                if "timestamp" not in df.columns and "startedAt" in df.columns:
+                    df["timestamp"] = df["startedAt"]
+                if "volume" not in df.columns and "baseTokenVolume" in df.columns:
+                    df["volume"] = df["baseTokenVolume"]
+
+                need = ["timestamp", "open", "high", "low", "close", "volume"]
+                missing = [c for c in need if c not in df.columns]
+                if missing:
+                    raise SystemExit(f"replay csv missing columns: {missing}")
+
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                df = df.sort_values("timestamp").reset_index(drop=True)
+
+                max_n = int(getattr(args, "replay_max_bars", 0) or 0)
+                if max_n > 0:
+                    df = df.iloc[:max_n].copy().reset_index(drop=True)
+
+                sleep_s = float(getattr(args, "replay_sleep_sec", 0.0) or 0.0)
+
+                print("Replay CSV:", str(p))
+                print("Replay bars:", int(len(df)))
+
+                prefill_n = int(max(0, int(getattr(args, "backfill_hours", 0) or 0)) * 60)
+                prefill_n = min(int(prefill_n), int(len(df)))
+
+                # Match live startup behavior: set an initial backfill window all at once, then
+                # replay subsequent bars through the normal on_closed_bar pipeline.
+                if prefill_n > 0:
+                    pre = df.iloc[:prefill_n][need].copy()
+                    pre["timestamp"] = pd.to_datetime(pre["timestamp"], utc=True)
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        pre[c] = pd.to_numeric(pre[c], errors="coerce").astype(float)
+
+                    runner.bars = pre.reset_index(drop=True)
+
+                    # Persist the backfill chunk by date (same as warm_backfill).
+                    try:
+                        for d, g in runner.bars.assign(date=lambda x: pd.to_datetime(x["timestamp"]).dt.date).groupby("date"):
+                            p2 = Path(out_dir) / f"minute_bars_{d}.csv"
+                            p2.parent.mkdir(parents=True, exist_ok=True)
+                            g.drop(columns=["date"]).to_csv(p2, index=False)
+                    except Exception:
+                        pass
+
+                for ts, o, h, l, c, v in df.iloc[prefill_n:][need].itertuples(index=False, name=None):
+                    runner.on_closed_bar(
+                        {
+                            "timestamp": pd.to_datetime(ts, utc=True),
+                            "open": float(o),
+                            "high": float(h),
+                            "low": float(l),
+                            "close": float(c),
+                            "volume": float(v),
+                        },
+                        allow_trade_logic=True,
+                    )
+                    if sleep_s > 0:
+                        time.sleep(float(sleep_s))
+
+                runner.flush_outputs()
+                raise SystemExit(0)
 
             # Warm backfill
             bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
