@@ -1710,6 +1710,13 @@ def main() -> None:
     ap.add_argument("--subaccount-trading", type=int, default=int(os.getenv("DYDX_SUBACCOUNT_TRADING", "1")))
     ap.add_argument("--subaccount-bank", type=int, default=int(os.getenv("DYDX_SUBACCOUNT_BANK", "0")))
 
+    ap.add_argument(
+        "--bank-threshold-usdc",
+        type=float,
+        default=float(os.getenv("DYDX_BANK_THRESHOLD_USDC", "200")),
+        help="Early-stage regime threshold; topup budget cap applies only while bank_equity < this value.",
+    )
+
     ap.add_argument("--backfill-hours", type=int, default=168)
     ap.add_argument(
         "--seed-csv",
@@ -1734,6 +1741,7 @@ def main() -> None:
     cfg.market = str(args.market).upper()
     cfg.subaccount_trading = int(args.subaccount_trading)
     cfg.subaccount_bank = int(args.subaccount_bank)
+    cfg.bank_threshold_usdc = float(args.bank_threshold_usdc)
 
     entry = load_entry_model(Path(args.entry_model))
     exit_gap = load_exit_gap_model(Path(args.exit_gap_model))
