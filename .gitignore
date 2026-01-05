@@ -106,6 +106,7 @@ data/pattern_entry_regressor/*
 !data/exit_oracle/
 data/exit_oracle/*
 !data/exit_oracle/exit_oracle_gap_regressor_hold15_2026-01-03T16-13-20Z.joblib
+!data/exit_oracle/exit_oracle_gap_regressor_hold15_2026-01-04T14-57-25Z.joblib
 
 # --- Additional deploy artifacts for the 3 live dYdX runners ---
 
