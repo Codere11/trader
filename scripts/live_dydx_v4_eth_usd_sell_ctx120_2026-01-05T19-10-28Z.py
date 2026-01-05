@@ -424,19 +424,20 @@ class CandleAggregator:
 
 
 def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, Any]]", stop_evt: threading.Event) -> None:
+    # Match BTC runner behavior: handle both snapshot (type=subscribed) and stream (type=channel_data).
     agg = CandleAggregator()
 
-    def on_open(sock):
+    def on_open(ws):
         try:
             msg = {"type": "subscribe", "channel": "v4_candles", "id": str(market).upper(), "resolution": "1MIN"}
-            sock.send(json.dumps(msg))
+            ws.send(json.dumps(msg))
         except Exception:
             pass
 
-    def on_message(sock, message: str):
+    def on_message(ws, message: str):
         if stop_evt.is_set():
             try:
-                sock.close()
+                ws.close()
             except Exception:
                 pass
             return
@@ -446,29 +447,56 @@ def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, A
         except Exception:
             return
 
-        contents = msg.get("contents") if isinstance(msg, dict) else None
-        candles = contents.get("candles") if isinstance(contents, dict) else None
-        if not isinstance(candles, list):
+        if not isinstance(msg, dict):
             return
 
-        for c in candles:
-            if not isinstance(c, dict):
-                continue
-            closed = agg.ingest(c)
-            if closed is None:
-                continue
+        t = msg.get("type")
+        if t == "connected":
+            return
+
+        if t == "subscribed":
+            candles = ((msg.get("contents") or {}).get("candles") or [])
+            if isinstance(candles, list):
+                try:
+                    candles = sorted(candles, key=lambda c: (c or {}).get("startedAt") or "")
+                except Exception:
+                    pass
+                for c in candles:
+                    if not isinstance(c, dict):
+                        continue
+                    closed = agg.ingest(c)
+                    if closed is None:
+                        continue
+                    try:
+                        out_q.put_nowait(closed)
+                    except queue.Full:
+                        pass
+            return
+
+        if t == "channel_data" and msg.get("channel") == "v4_candles":
+            c = (msg.get("contents") or {})
+            if isinstance(c, dict):
+                closed = agg.ingest(c)
+                if closed is not None:
+                    try:
+                        out_q.put_nowait(closed)
+                    except queue.Full:
+                        pass
+            return
+
+        if t == "error":
             try:
-                out_q.put_nowait(closed)
-            except queue.Full:
+                print("ws_error_message:", msg)
+            except Exception:
                 pass
 
-    def on_error(sock, error):
+    def on_error(ws, error):
         if not stop_evt.is_set():
             print("ws_error:", error)
 
-    def on_close(sock, close_status_code=None, close_msg=None):
+    def on_close(ws, close_status_code=None, close_msg=None):
         if not stop_evt.is_set():
-            print("ws_closed")
+            print("ws_closed", close_status_code, close_msg)
 
     backoff = 1.0
     while not stop_evt.is_set():
