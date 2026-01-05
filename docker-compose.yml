@@ -28,7 +28,7 @@ services:
       - ./data/live_dydx/btc_buy:/app/data/live_dydx
       - ./data/pattern_entry_regressor:/app/data/pattern_entry_regressor:ro
       - ./data/exit_oracle:/app/data/exit_oracle:ro
-      - ./data/dydx_BTC-USD_1MIN_2026-01-02T18-50-42Z.csv:/app/data/dydx_BTC-USD_1MIN_2026-01-02T18-50-42Z.csv:ro
+      - ./data/seeds:/app/data/seeds:ro
     ports:
       - "127.0.0.1:8001:8001"
     healthcheck:
@@ -50,7 +50,7 @@ services:
       - --backfill-hours
       - "168"
       - --seed-csv
-      - /app/data/dydx_BTC-USD_1MIN_2026-01-02T18-50-42Z.csv
+      - /app/data/seeds/dydx_BTC-USD_1MIN_seed_168h.csv
       - --initial-topup-budget-usdc
       - "50"
       - --entry-model
@@ -110,7 +110,7 @@ services:
       - ./data/live_dydx/eth_buy:/app/data/live_dydx
       - ./data/entry_regressor_oracle15m_2026-01-04T11-28-38Z:/app/data/entry_regressor_oracle15m_2026-01-04T11-28-38Z:ro
       - ./data/exit_oracle:/app/data/exit_oracle:ro
-      - ./data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv:/app/data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv:ro
+      - ./data/seeds:/app/data/seeds:ro
     ports:
       - "127.0.0.1:8002:8002"
     healthcheck:
@@ -132,7 +132,7 @@ services:
       - --backfill-hours
       - "168"
       - --seed-csv
-      - /app/data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv
+      - /app/data/seeds/dydx_ETH-USD_1MIN_seed_168h.csv
       - --initial-topup-budget-usdc
       - "50"
       - --bank-threshold-usdc
@@ -176,7 +176,7 @@ services:
       - ./data/live_dydx/eth_sell:/app/data/live_dydx
       - ./data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:/app/data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:ro
       - ./data/exit_oracle_sell:/app/data/exit_oracle_sell:ro
-      - ./data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv:/app/data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv:ro
+      - ./data/seeds:/app/data/seeds:ro
     ports:
       - "127.0.0.1:8003:8003"
     healthcheck:

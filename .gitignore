@@ -106,3 +106,24 @@ data/pattern_entry_regressor/*
 !data/exit_oracle/
 data/exit_oracle/*
 !data/exit_oracle/exit_oracle_gap_regressor_hold15_2026-01-03T16-13-20Z.joblib
+
+# --- Additional deploy artifacts for the 3 live dYdX runners ---
+
+# Small seed CSVs (used only as fallback if REST warm-backfill fails)
+!data/seeds/
+!data/seeds/*.csv
+
+# ETH BUY entry model
+!data/entry_regressor_oracle15m_2026-01-04T11-28-38Z/
+!data/entry_regressor_oracle15m_2026-01-04T11-28-38Z/models/
+!data/entry_regressor_oracle15m_2026-01-04T11-28-38Z/models/entry_regressor_buy_oracle15m_2026-01-04T11-28-38Z.joblib
+
+# ETH SELL entry model
+!data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z/
+!data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z/models/
+!data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z/models/entry_regressor_sell_oracle15m_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z.joblib
+
+# ETH SELL exit-gap model (keep only the model file; exclude large parquet datasets)
+!data/exit_oracle_sell/
+data/exit_oracle_sell/*
+!data/exit_oracle_sell/exit_oracle_gap_regressor_sell_hold15_top10_2026-01-05T12-27-59Z.joblib

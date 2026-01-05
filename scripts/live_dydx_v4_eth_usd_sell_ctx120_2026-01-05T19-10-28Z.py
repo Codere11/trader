@@ -1815,7 +1815,7 @@ def main() -> None:
 
     ap.add_argument(
         "--seed-csv",
-        default=str(REPO_ROOT / "data" / "dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv"),
+        default=str(REPO_ROOT / "data" / "seeds" / "dydx_ETH-USD_1MIN_seed_168h.csv"),
         help="Optional local CSV to seed bars if warm backfill fails. Use '' to disable.",
     )
 
@@ -1891,7 +1891,7 @@ def main() -> None:
 
     if bars.empty and seed_csv is not None and seed_csv.exists():
         try:
-            df = pd.read_csv(seed_csv)
+            df = pd.read_csv(seed_csv, comment="#")
             if "timestamp" not in df.columns and "startedAt" in df.columns:
                 df["timestamp"] = df["startedAt"]
             if "volume" not in df.columns and "baseTokenVolume" in df.columns:

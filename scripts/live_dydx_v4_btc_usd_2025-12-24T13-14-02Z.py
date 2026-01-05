@@ -3804,7 +3804,7 @@ def main() -> None:
 
     ap.add_argument(
         "--seed-csv",
-        default=str(REPO_ROOT / "data" / "dydx_BTC-USD_1MIN_2026-01-02T18-50-42Z.csv"),
+        default=str(REPO_ROOT / "data" / "seeds" / "dydx_BTC-USD_1MIN_seed_168h.csv"),
         help="Optional local CSV to seed bars if warm backfill fails. Use '' to disable.",
     )
 
@@ -4166,7 +4166,7 @@ def main() -> None:
             seed_csv = Path(args.seed_csv) if str(getattr(args, "seed_csv", "") or "").strip() else None
             if bars.empty and seed_csv is not None and seed_csv.exists():
                 try:
-                    df = pd.read_csv(seed_csv)
+                    df = pd.read_csv(seed_csv, comment="#")
                     # Accept either 'timestamp' or dYdX-style 'startedAt'
                     if "timestamp" not in df.columns and "startedAt" in df.columns:
                         df["timestamp"] = df["startedAt"]

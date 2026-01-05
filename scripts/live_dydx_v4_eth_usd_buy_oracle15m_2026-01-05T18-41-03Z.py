@@ -1713,7 +1713,7 @@ def main() -> None:
     ap.add_argument("--backfill-hours", type=int, default=168)
     ap.add_argument(
         "--seed-csv",
-        default=str(REPO_ROOT / "data" / "dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv"),
+        default=str(REPO_ROOT / "data" / "seeds" / "dydx_ETH-USD_1MIN_seed_168h.csv"),
         help="Optional local CSV to seed bars if warm backfill fails. Use '' to disable.",
     )
 
@@ -1776,7 +1776,7 @@ def main() -> None:
     # Warm backfill (required for stable features). If it fails and seed_csv exists, use it.
     bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
     if bars.empty and seed_csv is not None and seed_csv.exists():
-        df = pd.read_csv(seed_csv)
+        df = pd.read_csv(seed_csv, comment="#")
         if "timestamp" not in df.columns and "startedAt" in df.columns:
             df["timestamp"] = df["startedAt"]
         if "volume" not in df.columns and "baseTokenVolume" in df.columns:
