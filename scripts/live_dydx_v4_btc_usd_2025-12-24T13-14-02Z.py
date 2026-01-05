@@ -53,6 +53,47 @@ class ExitGapRegressor:
     created_utc: Optional[str]
 
 
+@dataclass
+class TopupBudget:
+    """Persisted per-agent budget for initial (pre-threshold) topups.
+
+    We treat bank->trading *floor topups while bank_equity < bank_threshold* as consuming
+    the agent's initial external topup budget. Once exhausted, the agent will refuse
+    new entries (but will always allow exits).
+    """
+
+    budget_usdc: float
+    spent_usdc: float
+    state_path: Path
+
+    def remaining_usdc(self) -> float:
+        return max(0.0, float(self.budget_usdc) - float(self.spent_usdc))
+
+    def exhausted(self) -> bool:
+        return float(self.spent_usdc) >= float(self.budget_usdc)
+
+    def load(self) -> None:
+        try:
+            if not self.state_path.exists():
+                return
+            obj = json.loads(self.state_path.read_text(encoding="utf-8"))
+            self.spent_usdc = float(obj.get("spent_usdc") or obj.get("initial_topup_spent_usdc") or 0.0)
+        except Exception:
+            return
+
+    def save(self) -> None:
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "updated_utc": _now_ts(),
+                "budget_usdc": float(self.budget_usdc),
+                "spent_usdc": float(self.spent_usdc),
+            }
+            self.state_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            return
+
+
 def load_exit_gap_regressor(path: Optional[Path]) -> Optional[ExitGapRegressor]:
     if path is None:
         return None
@@ -835,10 +876,12 @@ async def _wait_for_fills(
     return best
 
 
-async def _ensure_trading_floor(clients, cfg: DydxV4Config) -> Dict[str, Any]:
+async def _ensure_trading_floor(clients, cfg: DydxV4Config, *, budget: Optional[TopupBudget] = None) -> Dict[str, Any]:
     """Top up trading subaccount from bank to reach the configured floor (between trades).
 
-    Policy: only allow bank->trading floor topups when bank_equity < cfg.bank_threshold_usdc.
+    Policy:
+    - Only allow bank->trading floor topups when bank_equity < cfg.bank_threshold_usdc.
+    - If a TopupBudget is provided, floor topups in this regime consume budget and are capped.
     """
 
     trading_eq = float(await _get_subaccount_equity_usdc(clients, address=cfg.address, subaccount_number=cfg.subaccount_trading))
@@ -866,12 +909,55 @@ async def _ensure_trading_floor(clients, cfg: DydxV4Config) -> Dict[str, Any]:
             "floor_usdc": float(floor),
         }
 
-    if bank_eq < needed:
-        raise RuntimeError(
-            f"Bank subaccount cannot top up to floor: bank_eq={bank_eq:.6f} < needed={needed:.6f} (floor={floor:.6f}, trading_eq={trading_eq:.6f})"
-        )
+    if budget is not None and budget.exhausted():
+        return {
+            "topped_up": False,
+            "needed_usdc": float(needed),
+            "transferred_usdc": 0.0,
+            "skipped": True,
+            "skip_reason": "initial_topup_budget_exhausted",
+            "budget_usdc": float(budget.budget_usdc),
+            "spent_usdc": float(budget.spent_usdc),
+            "bank_equity_usdc": float(bank_eq),
+            "bank_threshold_usdc": float(bank_threshold),
+            "trading_equity_usdc": float(trading_eq),
+            "floor_usdc": float(floor),
+        }
 
-    amt_q = usdc_to_quantums(needed)
+    remaining = float(budget.remaining_usdc()) if budget is not None else float("inf")
+    transfer = float(min(float(needed), float(bank_eq), float(remaining)))
+
+    if transfer <= 0.0:
+        return {
+            "topped_up": False,
+            "needed_usdc": float(needed),
+            "transferred_usdc": 0.0,
+            "skipped": True,
+            "skip_reason": "no_transfer_possible",
+            "budget_usdc": (float(budget.budget_usdc) if budget is not None else None),
+            "spent_usdc": (float(budget.spent_usdc) if budget is not None else None),
+            "bank_equity_usdc": float(bank_eq),
+            "bank_threshold_usdc": float(bank_threshold),
+            "trading_equity_usdc": float(trading_eq),
+            "floor_usdc": float(floor),
+        }
+
+    amt_q = usdc_to_quantums(float(transfer))
+    if int(amt_q) <= 0:
+        return {
+            "topped_up": False,
+            "needed_usdc": float(needed),
+            "transferred_usdc": 0.0,
+            "skipped": True,
+            "skip_reason": "transfer_amount_rounded_to_zero",
+            "budget_usdc": (float(budget.budget_usdc) if budget is not None else None),
+            "spent_usdc": (float(budget.spent_usdc) if budget is not None else None),
+            "bank_equity_usdc": float(bank_eq),
+            "bank_threshold_usdc": float(bank_threshold),
+            "trading_equity_usdc": float(trading_eq),
+            "floor_usdc": float(floor),
+        }
+
     tx = await clients.node.transfer(
         clients.wallet,
         subaccount(cfg.address, int(cfg.subaccount_bank)),
@@ -880,17 +966,23 @@ async def _ensure_trading_floor(clients, cfg: DydxV4Config) -> Dict[str, Any]:
         int(amt_q),
     )
 
+    if budget is not None:
+        budget.spent_usdc = float(budget.spent_usdc) + float(transfer)
+        budget.save()
+
     return {
         "topped_up": True,
         "needed_usdc": float(needed),
-        "transferred_usdc": float(needed),
+        "transferred_usdc": float(transfer),
+        "budget_usdc": (float(budget.budget_usdc) if budget is not None else None),
+        "spent_usdc": (float(budget.spent_usdc) if budget is not None else None),
         "bank_equity_usdc": float(bank_eq),
         "bank_threshold_usdc": float(bank_threshold),
         "tx": _pb_to_jsonable(tx),
     }
 
 
-async def _refinance_after_liquidation(clients, cfg: DydxV4Config) -> Dict[str, Any]:
+async def _refinance_after_liquidation(clients, cfg: DydxV4Config, *, budget: Optional[TopupBudget] = None) -> Dict[str, Any]:
     """Refinance trading subaccount after a detected liquidation.
 
     Policy:
@@ -913,6 +1005,26 @@ async def _refinance_after_liquidation(clients, cfg: DydxV4Config) -> Dict[str, 
         requested = max(0.0, float(floor) - float(trading_eq))
         # If the bank can't cover it, transfer what we can.
         requested = min(float(requested), float(bank_eq))
+
+        # Budget applies only while bank < threshold.
+        if budget is not None and budget.exhausted():
+            return {
+                "attempted": False,
+                "action": str(action),
+                "requested_usdc": float(requested),
+                "transferred_usdc": 0.0,
+                "budget_usdc": float(budget.budget_usdc),
+                "spent_usdc": float(budget.spent_usdc),
+                "skip_reason": "initial_topup_budget_exhausted",
+                "bank_equity_usdc": float(bank_eq),
+                "trading_equity_usdc": float(trading_eq),
+                "bank_threshold_usdc": float(bank_threshold),
+                "trade_floor_usdc": float(floor),
+                "liquidation_recap_bank_frac": float(recap_frac),
+            }
+
+        if budget is not None:
+            requested = min(float(requested), float(budget.remaining_usdc()))
     else:
         action = "bank_fraction"
         requested = max(0.0, float(bank_eq) * float(recap_frac))
@@ -956,11 +1068,17 @@ async def _refinance_after_liquidation(clients, cfg: DydxV4Config) -> Dict[str, 
 
     transferred = float(requested)
 
+    if budget is not None and str(action) == "refill_to_floor" and float(bank_eq) < float(bank_threshold):
+        budget.spent_usdc = float(budget.spent_usdc) + float(transferred)
+        budget.save()
+
     return {
         "attempted": True,
         "action": str(action),
         "requested_usdc": float(requested),
         "transferred_usdc": float(transferred),
+        "budget_usdc": (float(budget.budget_usdc) if budget is not None else None),
+        "spent_usdc": (float(budget.spent_usdc) if budget is not None else None),
         "bank_equity_usdc": float(bank_eq),
         "trading_equity_usdc": float(trading_eq),
         "bank_threshold_usdc": float(bank_threshold),
@@ -970,7 +1088,13 @@ async def _refinance_after_liquidation(clients, cfg: DydxV4Config) -> Dict[str, 
     }
 
 
-async def _siphon_profit_and_topup(clients, cfg: DydxV4Config, *, equity_before: float) -> Dict[str, Any]:
+async def _siphon_profit_and_topup(
+    clients,
+    cfg: DydxV4Config,
+    *,
+    equity_before: float,
+    budget: Optional[TopupBudget] = None,
+) -> Dict[str, Any]:
     """After a position is closed, siphon a configured fraction of realized profit to bank and top up to floor."""
 
     equity_after = float(await _get_subaccount_equity_usdc(clients, address=cfg.address, subaccount_number=cfg.subaccount_trading))
@@ -998,7 +1122,7 @@ async def _siphon_profit_and_topup(clients, cfg: DydxV4Config, *, equity_before:
             }
 
     # Top up (after siphon)
-    topup = await _ensure_trading_floor(clients, cfg)
+    topup = await _ensure_trading_floor(clients, cfg, budget=budget)
 
     return {
         "equity_before_usdc": float(equity_before),
@@ -1038,6 +1162,7 @@ class DydxRunner:
         metrics_port: int = 0,
         health_max_staleness_sec: float = 120.0,
         alert_cooldown_seconds: int = 300,
+        initial_topup_budget_usdc: float = 50.0,
     ):
         self.market = str(market).upper()
         self.models = models
@@ -1065,6 +1190,17 @@ class DydxRunner:
         self.alert_cooldown_seconds = int(alert_cooldown_seconds)
         self.last_closed_wall = time.time()
         self._last_alert_by_kind: Dict[str, float] = {}
+
+        # Initial topup budget (per agent / per trading subaccount).
+        st = re.sub(r"[^A-Za-z0-9]+", "_", str(self.market).lower()).strip("_")
+        budget_path = self.out_dir / f"topup_budget_state_{st}_tr{int(self.cfg.subaccount_trading)}_bank{int(self.cfg.subaccount_bank)}.json"
+        self.topup_budget = TopupBudget(
+            budget_usdc=float(initial_topup_budget_usdc),
+            spent_usdc=0.0,
+            state_path=budget_path,
+        )
+        self.topup_budget.load()
+        self.topup_budget.save()
 
         self.bars = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])  # closed bars only
         self.feats: Optional[pd.DataFrame] = None
@@ -2639,7 +2775,9 @@ class DydxRunner:
 
                             # Treat this as a liquidation / external close and apply bankroll policy.
                             try:
-                                refi = self.loop.run_until_complete(_refinance_after_liquidation(self.clients, self.cfg))
+                                refi = self.loop.run_until_complete(
+                                    _refinance_after_liquidation(self.clients, self.cfg, budget=self.topup_budget)
+                                )
                                 if self.bank_log is not None:
                                     try:
                                         txhash = _txhash_hex((((refi.get("tx") or {}).get("txResponse") or {}).get("txhash")))
@@ -2745,8 +2883,34 @@ class DydxRunner:
                     except Exception:
                         pass
 
+                # Hard stop: do not open new trades if the initial topup budget is exhausted.
+                if self.topup_budget.exhausted():
+                    self._alert(
+                        "entry_skipped_budget_exhausted",
+                        "Initial topup budget exhausted; skipping entry",
+                        trade_id=str(trade_id),
+                        budget_usdc=float(self.topup_budget.budget_usdc),
+                        spent_usdc=float(self.topup_budget.spent_usdc),
+                    )
+                    if self.bank_log is not None:
+                        try:
+                            self.bank_log.write_event(
+                                "bank_entry_skipped_budget_exhausted",
+                                {
+                                    "symbol": self.market,
+                                    "trade_id": trade_id,
+                                    "trade_mode": "real",
+                                    "direction": "LONG",
+                                    "budget_usdc": float(self.topup_budget.budget_usdc),
+                                    "spent_usdc": float(self.topup_budget.spent_usdc),
+                                },
+                            )
+                        except Exception:
+                            pass
+                    return
+
                 # real: ensure floor BEFORE measuring equity baseline (so profit calc doesn't treat top-ups as profit).
-                topup_pre = self.loop.run_until_complete(_ensure_trading_floor(self.clients, self.cfg))
+                topup_pre = self.loop.run_until_complete(_ensure_trading_floor(self.clients, self.cfg, budget=self.topup_budget))
                 equity_before = float(
                     self.loop.run_until_complete(
                         _get_subaccount_equity_usdc(
@@ -2756,6 +2920,34 @@ class DydxRunner:
                         )
                     )
                 )
+
+                # If we could not reach the floor (budget exhausted / bank too small), refuse the entry.
+                if float(equity_before) < float(self.cfg.trade_floor_usdc):
+                    self._alert(
+                        "entry_skipped_no_floor",
+                        "Trading equity below floor; skipping entry",
+                        trade_id=str(trade_id),
+                        trading_equity_usdc=float(equity_before),
+                        trade_floor_usdc=float(self.cfg.trade_floor_usdc),
+                        topup_pre=topup_pre,
+                    )
+                    if self.bank_log is not None:
+                        try:
+                            self.bank_log.write_event(
+                                "bank_entry_skipped_no_floor",
+                                {
+                                    "symbol": self.market,
+                                    "trade_id": trade_id,
+                                    "trade_mode": "real",
+                                    "direction": "LONG",
+                                    "trading_equity_usdc": float(equity_before),
+                                    "trade_floor_usdc": float(self.cfg.trade_floor_usdc),
+                                    "topup_pre": topup_pre,
+                                },
+                            )
+                        except Exception:
+                            pass
+                    return
 
                 if self.bank_log is not None:
                     try:
@@ -3134,7 +3326,9 @@ class DydxRunner:
 
             # Give indexer a moment to reflect equity.
             time.sleep(0.75)
-            bank_ops = self.loop.run_until_complete(_siphon_profit_and_topup(self.clients, self.cfg, equity_before=equity_before))
+            bank_ops = self.loop.run_until_complete(
+                _siphon_profit_and_topup(self.clients, self.cfg, equity_before=equity_before, budget=self.topup_budget)
+            )
 
             # Bank-proof snapshot after close + post-trade internal transfers.
             if self.bank_log is not None:
@@ -3592,6 +3786,9 @@ def main() -> None:
     ap.add_argument("--target-frac", type=float, default=0.0001, help="Entry take fraction (0.0001=0.01%%, 0.001=0.1%%)")
     ap.add_argument("--hold-min", type=int, default=15)
 
+    ap.add_argument("--subaccount-trading", type=int, default=int(os.getenv("DYDX_SUBACCOUNT_TRADING", "1")))
+    ap.add_argument("--subaccount-bank", type=int, default=int(os.getenv("DYDX_SUBACCOUNT_BANK", "0")))
+
     ap.add_argument(
         "--exit-gap-model",
         default="",
@@ -3603,7 +3800,20 @@ def main() -> None:
     ap.add_argument("--trade-mode", choices=["paper", "real"], default="paper")
     ap.add_argument("--yes-really", action="store_true", help="Required for --trade-mode real")
 
-    ap.add_argument("--backfill-hours", type=int, default=48)
+    ap.add_argument("--backfill-hours", type=int, default=168)
+
+    ap.add_argument(
+        "--seed-csv",
+        default=str(REPO_ROOT / "data" / "dydx_BTC-USD_1MIN_2026-01-02T18-50-42Z.csv"),
+        help="Optional local CSV to seed bars if warm backfill fails. Use '' to disable.",
+    )
+
+    ap.add_argument(
+        "--initial-topup-budget-usdc",
+        type=float,
+        default=50.0,
+        help="Hard stop budget: once exceeded, the runner will refuse new entries (exits still allowed).",
+    )
 
     # Offline replay mode: feed bars from CSV instead of WS/REST.
     ap.add_argument(
@@ -3691,6 +3901,8 @@ def main() -> None:
 
     cfg = DydxV4Config.from_env()
     cfg.market = str(args.market).upper()
+    cfg.subaccount_trading = int(args.subaccount_trading)
+    cfg.subaccount_bank = int(args.subaccount_bank)
 
     exit_path = Path(args.exit_model) if str(args.exit_model).strip() else None
     models = load_models(Path(args.entry_model), exit_path)
@@ -3856,6 +4068,7 @@ def main() -> None:
                 retention_days=int(args.retention_days),
                 metrics_port=int(args.metrics_port),
                 health_max_staleness_sec=float(args.health_max_staleness_sec),
+                initial_topup_budget_usdc=float(getattr(args, "initial_topup_budget_usdc", 50.0)),
             )
 
             # Start health/metrics server (optional)
@@ -3949,6 +4162,33 @@ def main() -> None:
 
             # Warm backfill
             bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
+
+            seed_csv = Path(args.seed_csv) if str(getattr(args, "seed_csv", "") or "").strip() else None
+            if bars.empty and seed_csv is not None and seed_csv.exists():
+                try:
+                    df = pd.read_csv(seed_csv)
+                    # Accept either 'timestamp' or dYdX-style 'startedAt'
+                    if "timestamp" not in df.columns and "startedAt" in df.columns:
+                        df["timestamp"] = df["startedAt"]
+                    if "volume" not in df.columns and "baseTokenVolume" in df.columns:
+                        df["volume"] = df["baseTokenVolume"]
+
+                    need = ["timestamp", "open", "high", "low", "close", "volume"]
+                    df = df[need].copy()
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce").astype(float)
+
+                    # Keep last <backfill-hours> worth of bars
+                    end_ts = df["timestamp"].max()
+                    start_ts = end_ts - timedelta(hours=int(args.backfill_hours))
+                    bars = df[df["timestamp"] >= start_ts].copy().sort_values("timestamp").reset_index(drop=True)
+
+                    if not bars.empty:
+                        print("Warm backfill failed; seeded from CSV:", str(seed_csv))
+                except Exception as e:
+                    print("Seed CSV load failed:", e)
+
             if not bars.empty:
                 runner.bars = bars
                 # Persist backfill by date
