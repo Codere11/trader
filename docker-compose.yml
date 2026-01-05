@@ -36,7 +36,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s
     command:
       - python3
       - scripts/live_dydx_v4_btc_usd_2025-12-24T13-14-02Z.py
@@ -118,7 +118,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s
     command:
       - python3
       - scripts/live_dydx_v4_eth_usd_buy_oracle15m_2026-01-05T18-41-03Z.py
@@ -184,7 +184,7 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 120s
     command:
       - python3
       - scripts/live_dydx_v4_eth_usd_sell_ctx120_2026-01-05T19-10-28Z.py
