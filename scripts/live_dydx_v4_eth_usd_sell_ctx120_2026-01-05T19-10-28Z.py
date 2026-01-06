@@ -658,6 +658,10 @@ class EthSellRunner:
         self.metrics_port = int(metrics_port)
         self.health_max_staleness_sec = float(health_max_staleness_sec)
 
+        # Feed integrity
+        self.bar_gap_backfills_total = 0
+        self.last_bar_time_utc: Optional[str] = None
+
         self.last_closed_wall = time.time()
 
     def _load_budget_state(self) -> None:
@@ -1435,6 +1439,47 @@ class EthSellRunner:
             "topup": topup,
         }
 
+    def _rest_fetch_1m_bars(self, *, start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> List[Dict[str, Any]]:
+        """Fetch CLOSED 1m bars from indexer REST (best-effort), sorted ascending by timestamp."""
+        s = pd.to_datetime(start_utc, utc=True)
+        e = pd.to_datetime(end_utc, utc=True)
+        if e < s:
+            return []
+
+        try:
+            resp = self.loop.run_until_complete(
+                self.clients.indexer.markets.get_perpetual_market_candles(
+                    market=str(self.market),
+                    resolution="1MIN",
+                    from_iso=s.to_pydatetime().isoformat().replace("+00:00", "Z"),
+                    to_iso=e.to_pydatetime().isoformat().replace("+00:00", "Z"),
+                    limit=1000,
+                )
+            )
+        except Exception as ex:
+            print("rest_backfill_failed:", ex)
+            return []
+
+        candles = resp.get("candles") if isinstance(resp, dict) else None
+        if not isinstance(candles, list) or not candles:
+            return []
+
+        df = pd.DataFrame(candles)
+        if df.empty:
+            return []
+
+        df["timestamp"] = pd.to_datetime(df["startedAt"], utc=True)
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df["baseTokenVolume"].astype(float)
+
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+        df = df[(df["timestamp"] >= s) & (df["timestamp"] <= e)].copy()
+        return df.to_dict("records")
+
     def _append_bar(self, bar: Mapping[str, Any]) -> int:
         row = {
             "timestamp": pd.to_datetime(bar["timestamp"], utc=True),
@@ -1459,8 +1504,31 @@ class EthSellRunner:
 
         return int(len(self.bars) - 1)
 
-    def on_closed_bar(self, bar: Mapping[str, Any]) -> None:
+    def on_closed_bar(self, bar: Mapping[str, Any], *, allow_trade_logic: bool = True) -> None:
         self.last_closed_wall = float(time.time())
+
+        # Detect missing-minute gaps and backfill via REST for feature continuity.
+        try:
+            ts = pd.to_datetime(bar["timestamp"], utc=True)
+        except Exception:
+            ts = None
+
+        if ts is not None and self.bars is not None and len(self.bars) > 0:
+            prev_ts = pd.to_datetime(self.bars.iloc[-1]["timestamp"], utc=True)
+            if ts > (prev_ts + timedelta(minutes=1)):
+                gap_mins = int((ts - prev_ts).total_seconds() // 60) - 1
+                print(f"bar_gap_detected: prev_ts={prev_ts} ts={ts} gap_mins={gap_mins}")
+
+                bf_start = prev_ts + timedelta(minutes=1)
+                bf_end = ts - timedelta(minutes=1)
+                missing_rows = self._rest_fetch_1m_bars(start_utc=bf_start, end_utc=bf_end)
+                if missing_rows:
+                    self.bar_gap_backfills_total = int(self.bar_gap_backfills_total) + 1
+                    for r in missing_rows:
+                        try:
+                            self.on_closed_bar(r, allow_trade_logic=False)
+                        except Exception:
+                            pass
 
         i = self._append_bar(bar)
         self._recompute_feature_sources()
@@ -1468,8 +1536,22 @@ class EthSellRunner:
         if self.bars is None:
             return
 
+        try:
+            self.last_bar_time_utc = _iso_utc(pd.to_datetime(self.bars.iloc[-1]["timestamp"], utc=True))
+        except Exception:
+            self.last_bar_time_utc = None
+
         day = pd.to_datetime(self.bars.iloc[i]["timestamp"], utc=True).date()
         self._roll_day(day)
+
+        # Always update score stream (used to form thresholds), even for backfilled bars.
+        score = self._entry_score_at(int(i))
+        if score is not None and np.isfinite(float(score)):
+            self.scores_cur_day.append(float(score))
+
+        # For backfilled bars we do NOT run trade logic (can't time-travel orders).
+        if not bool(allow_trade_logic):
+            return
 
         # Paper pending entry executes at next bar open.
         if self.trade_mode == "paper" and self.pending_entry is not None and self.open_trade is None:
@@ -1646,10 +1728,6 @@ class EthSellRunner:
             return
 
         # No open trade: consider opening.
-        score = self._entry_score_at(int(i))
-        if score is not None and np.isfinite(float(score)):
-            self.scores_cur_day.append(float(score))
-
         if self.open_trade is not None:
             return
 
@@ -1774,6 +1852,8 @@ class EthSellRunner:
                             "trade_mode": str(getattr(runner, "trade_mode", "")),
                             "has_open_trade": bool(getattr(runner, "open_trade", None) is not None),
                             "records_total": int(len(getattr(runner, "records", []) or [])),
+                            "last_bar_time_utc": getattr(runner, "last_bar_time_utc", None),
+                            "bar_gap_backfills_total": int(getattr(runner, "bar_gap_backfills_total", 0) or 0),
                         }
                         body = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
                         self.send_response(status)
