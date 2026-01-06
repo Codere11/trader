@@ -1976,12 +1976,6 @@ def main() -> None:
 
     if str(args.trade_mode).lower() == "real":
         runner.reconcile_startup()
-        # Top up to floor from bank on startup (tolerate 404 if subaccount not initialized yet)
-        try:
-            topup_result = loop.run_until_complete(runner._ensure_trading_floor_with_budget())
-            print(f"Startup topup: {topup_result}")
-        except Exception as e:
-            print(f"Startup topup skipped (subaccount may need manual init): {e}")
 
     # Warm backfill (for stable features + threshold seeding)
     bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
