@@ -198,7 +198,7 @@ services:
       - --backfill-hours
       - "168"
       - --seed-csv
-      - /app/data/dydx_ETH-USD_1MIN_full_2026-01-03T23-48-53Z.csv
+      - /app/data/seeds/dydx_ETH-USD_1MIN_seed_168h.csv
       - --initial-topup-budget-usdc
       - "50"
       - --bank-threshold-usdc
