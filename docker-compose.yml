@@ -172,22 +172,16 @@ services:
       DYDX_MAX_LEVERAGE: ${DYDX_MAX_LEVERAGE:-auto}
       DYDX_USE_MARGIN_FRAC: ${DYDX_USE_MARGIN_FRAC:-1.0}
       DYDX_LEVERAGE_SAFETY_FRAC: ${DYDX_LEVERAGE_SAFETY_FRAC:-1.0}
+      ETH_SELL_ENTRY_THRESHOLD: ${ETH_SELL_ENTRY_THRESHOLD:-0.39}
     volumes:
-      - ./data/live_dydx/eth_sell:/app/data/live_dydx
+      - ./data/live_dydx/eth_sell:/app/data/live_dydx/eth_sell
       - ./data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:/app/data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:ro
       - ./data/exit_oracle_sell:/app/data/exit_oracle_sell:ro
-      - ./data/seeds:/app/data/seeds:ro
     ports:
       - "127.0.0.1:8003:8003"
-    healthcheck:
-      test: ["CMD", "python3", "scripts/healthcheck.py", "--port", "8003"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 120s
     command:
       - python3
-      - scripts/live_dydx_v4_eth_usd_sell_ctx120_2026-01-05T19-10-28Z.py
+      - scripts/live_dydx_v4_eth_usd_sell_simple_2026-01-06T22-16-46Z.py
       - --trade-mode
       - real
       - --yes-really
@@ -196,18 +190,20 @@ services:
       - --subaccount-bank
       - "${DYDX_SUBACCOUNT_BANK_SHARED:-0}"
       - --backfill-hours
-      - "168"
-      - --seed-csv
-      - /app/data/seeds/dydx_ETH-USD_1MIN_seed_168h.csv
-      - --initial-topup-budget-usdc
-      - "50"
-      - --bank-threshold-usdc
-      - "${DYDX_BANK_THRESHOLD_USDC:-200}"
-      - --metrics-port
-      - "8003"
-      - --health-max-staleness-sec
-      - "120"
-      - --stall-seconds
-      - "300"
+      - "24"
+      - --entry-threshold
+      - "${ETH_SELL_ENTRY_THRESHOLD:-0.39}"
+      - --entry-model
+      - /app/data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z/models/entry_regressor_sell_oracle15m_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z.joblib
+      - --exit-gap-model
+      - /app/data/exit_oracle_sell/exit_oracle_gap_regressor_sell_hold15_top10_2026-01-05T12-27-59Z.joblib
+      - --hold-min
+      - "15"
+      - --exit-gap-tau
+      - "0.10"
+      - --exit-gap-min-exit-k
+      - "2"
+      - --log-every
+      - "60"
       - --out-dir
-      - /app/data/live_dydx
+      - /app/data/live_dydx/eth_sell
