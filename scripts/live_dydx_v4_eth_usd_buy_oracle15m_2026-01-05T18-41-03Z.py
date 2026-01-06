@@ -1674,7 +1674,9 @@ class EthRunner:
                     )
                 )
             )
-        except Exception:
+        except Exception as e:
+            # Tolerate 404 for new subaccounts that haven't been initialized yet
+            print(f"reconcile_startup: could not fetch position (subaccount may be new): {e}")
             live_sz = 0.0
 
         if abs(float(live_sz)) <= 0.0:
