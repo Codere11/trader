@@ -1974,6 +1974,9 @@ def main() -> None:
 
     if str(args.trade_mode).lower() == "real":
         runner.reconcile_startup()
+        # Top up to floor from bank on startup (ignores budget limit if bank > threshold)
+        topup_result = loop.run_until_complete(runner._ensure_trading_floor_with_budget())
+        print(f"Startup topup: {topup_result}")
 
     # Warm backfill (for stable features + threshold seeding)
     bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))

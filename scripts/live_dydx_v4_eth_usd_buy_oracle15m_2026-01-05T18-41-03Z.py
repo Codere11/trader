@@ -1861,9 +1861,12 @@ def main() -> None:
         health_max_staleness_sec=float(args.health_max_staleness_sec),
     )
 
-    # Safety: on startup in real mode, flatten any leftover position.
+    # Safety: on startup in real mode, flatten any leftover position and ensure floor.
     if str(args.trade_mode).lower() == "real":
         runner.reconcile_startup()
+        # Top up to floor from bank on startup (ignores budget limit if bank > threshold)
+        topup_result = loop.run_until_complete(_ensure_trading_floor(clients, cfg, budget=runner.topup_budget))
+        print(f"Startup topup: {topup_result}")
 
     # Warm backfill (required for stable features). If it fails and seed_csv exists, use it.
     bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
