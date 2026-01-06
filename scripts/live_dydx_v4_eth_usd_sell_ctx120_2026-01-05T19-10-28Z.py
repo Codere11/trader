@@ -955,7 +955,6 @@ class EthSellRunner:
                 "transferred_usdc": 0.0,
                 "skipped": True,
                 "skip_reason": "no_transfer_possible",
-                "budget_remaining_usdc": float(remaining),
                 "bank_equity_usdc": float(bank_eq),
                 "trading_equity_usdc": float(trading_eq),
             }
