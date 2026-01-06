@@ -54,6 +54,7 @@ from dydx_adapter import load_dotenv
 from dydx_adapter.v4 import DydxV4Config, connect_v4, new_client_id, usdc_to_quantums
 
 from dydx_v4_client import OrderFlags
+from dydx_v4_client.indexer.candles_resolution import CandlesResolution
 from dydx_v4_client.indexer.rest.constants import OrderType
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient
 from dydx_v4_client.indexer.socket.websocket import IndexerSocket
@@ -382,7 +383,9 @@ async def _wait_for_fills(
     return best
 
 
-class CandleAggregator:
+class CandleAssembler:
+    """Convert dYdX candle stream (updates within the minute) into CLOSED 1m bars."""
+
     def __init__(self) -> None:
         self._cur_started_at: Optional[pd.Timestamp] = None
         self._cur: Optional[Dict[str, Any]] = None
@@ -414,104 +417,67 @@ class CandleAggregator:
             return None
 
         if ts == prev_ts:
+            # in-minute update
             self._cur = dict(row)
             return None
 
+        # ts > prev_ts: previous minute is now closed
         closed = dict(self._cur or {})
         self._cur_started_at = ts
         self._cur = dict(row)
         return closed
 
 
-def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, Any]]", stop_evt: threading.Event) -> None:
-    # Match BTC runner behavior: handle both snapshot (type=subscribed) and stream (type=channel_data).
-    agg = CandleAggregator()
+def _run_ws_candles(
+    *,
+    ws_url: str,
+    market: str,
+    out_q: "queue.Queue[Dict[str, Any]]",
+    stop_evt: threading.Event,
+) -> None:
+    # Copy BTC runner WS setup exactly.
+    backoff = 1.0
 
-    def on_open(ws):
-        try:
-            # Match BTC runner: explicitly request non-batched stream.
-            msg = {
-                "type": "subscribe",
-                "channel": "v4_candles",
-                "id": str(market).upper(),
-                "resolution": "1MIN",
-                "batched": False,
-            }
-            ws.send(json.dumps(msg))
-        except Exception:
-            pass
+    while not stop_evt.is_set():
+        asm = CandleAssembler()
 
-    def on_message(ws, message: str):
-        if stop_evt.is_set():
-            try:
+        def on_open(ws):
+            ws.candles.subscribe(id=market, resolution=CandlesResolution.ONE_MINUTE, batched=False)
+
+        def on_message(ws, msg):
+            if stop_evt.is_set():
                 ws.close()
-            except Exception:
-                pass
-            return
-
-        try:
-            msg = json.loads(message)
-        except Exception:
-            return
-
-        if not isinstance(msg, dict):
-            return
-
-        t = msg.get("type")
-        if t == "connected":
-            return
-
-        def _emit(candle: Dict[str, Any]) -> None:
-            closed = agg.ingest(candle)
-            if closed is None:
                 return
-            try:
-                out_q.put_nowait(closed)
-            except queue.Full:
-                pass
 
-        def _emit_many(candles: List[Any]) -> None:
-            try:
-                candles2 = sorted([c for c in candles if isinstance(c, dict)], key=lambda c: c.get("startedAt") or "")
-            except Exception:
-                candles2 = [c for c in candles if isinstance(c, dict)]
-            for c in candles2:
-                _emit(c)
+            t = msg.get("type")
+            if t == "connected":
+                return
 
-        if t == "subscribed":
-            contents = (msg.get("contents") or {})
-            if isinstance(contents, dict):
-                candles = contents.get("candles")
-                if isinstance(candles, list):
-                    _emit_many(candles)
-            return
+            if t == "subscribed":
+                candles = ((msg.get("contents") or {}).get("candles") or [])
+                try:
+                    candles = sorted(candles, key=lambda c: c.get("startedAt") or "")
+                except Exception:
+                    pass
+                for c in candles:
+                    closed = asm.ingest(c)
+                    if closed is not None:
+                        out_q.put(closed)
+                return
 
-        if t == "channel_data" and msg.get("channel") == "v4_candles":
-            contents = (msg.get("contents") or {})
-            if isinstance(contents, dict):
-                candles = contents.get("candles")
-                if isinstance(candles, list):
-                    _emit_many(candles)
-                elif "startedAt" in contents:
-                    _emit(contents)
-            return
+            if t == "channel_data" and msg.get("channel") == "v4_candles":
+                c = (msg.get("contents") or {})
+                closed = asm.ingest(c)
+                if closed is not None:
+                    out_q.put(closed)
+                return
 
-        if t == "error":
-            try:
-                print("ws_error_message:", msg)
-            except Exception:
-                pass
-
-    def on_error(ws, error):
-        if not stop_evt.is_set():
+        def on_error(ws, error):
             print("ws_error:", error)
 
-    def on_close(ws, close_status_code=None, close_msg=None):
-        if not stop_evt.is_set():
-            print("ws_closed", close_status_code, close_msg)
+        def on_close(ws, status, msg):
+            print("ws_closed", status, msg)
 
-    backoff = 1.0
-    while not stop_evt.is_set():
         started = time.time()
         try:
             sock = IndexerSocket(url=ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
@@ -524,6 +490,7 @@ def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, A
 
         dur = float(time.time() - started)
         backoff = 1.0 if dur >= 60.0 else min(float(backoff) * 2.0, 60.0)
+        print(f"ws_reconnect_sleep_s={backoff:.1f}")
         time.sleep(float(backoff))
 
 
