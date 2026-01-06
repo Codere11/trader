@@ -927,14 +927,22 @@ class EthSellRunner:
 
     async def _ensure_trading_floor_with_budget(self) -> Dict[str, Any]:
         """Top up trading to floor from bank (between trades), honoring initial topup budget."""
-        trading_eq = float(await _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=self.cfg.subaccount_trading))
+        # Tolerate 404 for uninitialized subaccounts
+        try:
+            trading_eq = float(await _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=self.cfg.subaccount_trading))
+        except Exception:
+            trading_eq = 0.0
+
         floor = float(self.cfg.trade_floor_usdc)
 
         if trading_eq >= floor:
             return {"topped_up": False, "needed_usdc": 0.0, "transferred_usdc": 0.0}
 
         needed = float(floor - trading_eq)
-        bank_eq = float(await _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=self.cfg.subaccount_bank))
+        try:
+            bank_eq = float(await _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=self.cfg.subaccount_bank))
+        except Exception:
+            bank_eq = 0.0
         bank_threshold = float(getattr(self.cfg, "bank_threshold_usdc", float("inf")))
 
         # Only allow floor topups while bank < threshold (same policy as BTC runner).
@@ -1732,12 +1740,23 @@ class EthSellRunner:
             return
 
         # real mode: top up to floor (subject to budget), then open short.
-        topup_pre = self.loop.run_until_complete(self._ensure_trading_floor_with_budget())
-        equity_before = float(
-            self.loop.run_until_complete(
-                _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=int(self.cfg.subaccount_trading))
+        # Tolerate 404 for uninitialized subaccounts - they'll be initialized on first transfer.
+        try:
+            topup_pre = self.loop.run_until_complete(self._ensure_trading_floor_with_budget())
+        except Exception as e:
+            print(f"Pre-entry topup failed (subaccount may need init): {e}")
+            topup_pre = {"topped_up": False, "error": str(e)}
+
+        try:
+            equity_before = float(
+                self.loop.run_until_complete(
+                    _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=int(self.cfg.subaccount_trading))
+                )
             )
-        )
+        except Exception as e:
+            # Subaccount doesn't exist yet; treat as zero equity (will initialize on first transfer)
+            print(f"Could not query trading equity (subaccount may need init): {e}")
+            equity_before = 0.0
 
         # Hard floor: if we couldn't reach the floor (e.g., budget exhausted), skip opening.
         if float(equity_before) < float(self.cfg.trade_floor_usdc):
