@@ -331,24 +331,38 @@ def _run_ws_candles(
     stop_evt: threading.Event,
 ) -> None:
     backoff = 1.0
+    last_msg_time = [time.time()]  # Mutable for closure access
 
     while not stop_evt.is_set():
         asm = CandleAssembler()
+        print(f"[WS] Connecting to {ws_url} for {market}...")
 
         def on_open(ws):
+            print(f"[WS] Connected! Subscribing to {market} 1m candles...")
             ws.candles.subscribe(id=market, resolution=CandlesResolution.ONE_MINUTE, batched=False)
+            last_msg_time[0] = time.time()
 
         def on_message(ws, msg):
             if stop_evt.is_set():
                 ws.close()
                 return
 
+            last_msg_time[0] = time.time()
             t = msg.get("type")
-            if t in {"connected", "ping"}:
+            
+            if t == "connected":
+                print(f"[WS] Received 'connected' message")
+                return
+            
+            if t == "ping":
+                # Don't spam logs with pings
                 return
 
             if t == "subscribed":
+                ch = msg.get("channel")
+                print(f"[WS] Subscribed to channel: {ch}")
                 candles = ((msg.get("contents") or {}).get("candles") or [])
+                print(f"[WS] Initial candles batch: {len(candles)} candles")
                 try:
                     candles = sorted(candles, key=lambda c: c.get("startedAt") or "")
                 except Exception:
@@ -356,35 +370,49 @@ def _run_ws_candles(
                 for c in candles:
                     closed = asm.ingest(c)
                     if closed is not None:
+                        ts = closed.get("timestamp")
+                        print(f"[WS] Closed bar from initial batch: {ts}")
                         out_q.put(closed)
                 return
 
             if t == "channel_data" and msg.get("channel") == "v4_candles":
                 c = (msg.get("contents") or {})
+                ts = c.get("startedAt")
+                print(f"[WS] Received candle update: {ts}")
                 closed = asm.ingest(c)
                 if closed is not None:
+                    closed_ts = closed.get("timestamp")
+                    print(f"[WS] *** CLOSED BAR READY: {closed_ts} ***")
                     out_q.put(closed)
                 return
+            
+            # Log unhandled message types
+            print(f"[WS] Unhandled message type: {t}, channel: {msg.get('channel')}")
 
         def on_error(ws, error):
-            print("ws_error:", error)
+            print(f"[WS] ERROR: {error}")
 
         def on_close(ws, status, msg):
-            print("ws_closed", status, msg)
+            print(f"[WS] Connection closed - status: {status}, msg: {msg}")
 
         started = time.time()
         try:
             sock = IndexerSocket(url=ws_url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            print("[WS] Starting run_forever loop...")
             sock.run_forever(ping_interval=15, ping_timeout=10)
+            print("[WS] run_forever() exited")
         except Exception as e:
-            print("ws_loop_error:", e)
+            print(f"[WS] EXCEPTION in run_forever: {e}")
+            import traceback
+            traceback.print_exc()
 
         if stop_evt.is_set():
+            print("[WS] Stop event set, exiting")
             break
 
         dur = float(time.time() - started)
         backoff = 1.0 if dur >= 60.0 else min(float(backoff) * 2.0, 60.0)
-        print(f"ws_reconnect_sleep_s={backoff:.1f}")
+        print(f"[WS] Reconnecting in {backoff:.1f}s (connection lasted {dur:.1f}s)")
         time.sleep(float(backoff))
 
 
@@ -1668,19 +1696,43 @@ def main() -> None:
         print("Exit policy: tau=", float(args.exit_gap_tau), " min_exit_k=", int(args.exit_gap_min_exit_k), " hold_min=", int(args.hold_min))
         print("Audit:", str(audit_path))
         print("Out dir:", str(out_dir))
+        print("\n[MAIN] Waiting for candles from websocket...\n")
+
+        last_bar_time = time.time()
+        heartbeat_interval = 120.0  # Log status every 2 minutes if no bars
+        last_heartbeat = time.time()
+        bar_count = 0
 
         try:
             while not stop_evt.is_set():
                 try:
                     bar = q.get(timeout=5.0)
                 except queue.Empty:
+                    # Check if we've been idle too long
+                    now = time.time()
+                    idle_s = now - last_bar_time
+                    if now - last_heartbeat >= heartbeat_interval:
+                        print(f"[MAIN] HEARTBEAT: {bar_count} bars received, idle for {idle_s:.0f}s")
+                        last_heartbeat = now
+                    
+                    # Warn if no data for extended period
+                    if idle_s > 300:  # 5 minutes
+                        print(f"[MAIN] WARNING: No new bars for {idle_s:.0f}s - websocket may be stalled")
+                        last_bar_time = now  # Reset to avoid spam
                     continue
+
+                bar_count += 1
+                last_bar_time = time.time()
+                bar_ts = bar.get("timestamp")
+                print(f"[MAIN] Processing bar #{bar_count}: {bar_ts}")
 
                 try:
                     runner.on_closed_bar(bar)
                 except Exception as e:
                     # Runner must not die on a single bad bar.
-                    print("on_closed_bar_error:", e)
+                    print(f"[MAIN] ERROR in on_closed_bar: {e}")
+                    import traceback
+                    traceback.print_exc()
         finally:
             stop_evt.set()
             try:
