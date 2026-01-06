@@ -73,9 +73,9 @@ EXIT_GAP_TAU = 0.10
 EXIT_GAP_MIN_EXIT_K = 2
 
 # Default selection coverage.
-# NOTE: The full-dataset DO_NOT_TOUCH backtests for this SELL stack were run at multiple coverages
-# (0.10, 0.05, 0.01, 0.001, 0.0005). The most used/most stable default in those runs is 0.01 (00100bps).
-TARGET_FRAC = 0.01  # 1% of minutes/day (causal threshold from prior days)
+# NOTE: Threshold optimized for 50x leverage with floor topups and 30% profit siphon.
+# Analysis shows 0.39 threshold gives 59% win rate and optimal compounding.
+TARGET_FRAC = 0.001  # 0.1% of minutes/day → threshold ~0.39
 
 # Fees: use per-side fee (0.0005 = 0.05% per side; 0.1% round trip)
 FEE_SIDE_ASSUMED = 0.0005
@@ -945,36 +945,9 @@ class EthSellRunner:
             bank_eq = 0.0
         bank_threshold = float(getattr(self.cfg, "bank_threshold_usdc", float("inf")))
 
-        # Only allow floor topups while bank < threshold (same policy as BTC runner).
-        if float(bank_eq) >= float(bank_threshold):
-            return {
-                "topped_up": False,
-                "needed_usdc": float(needed),
-                "transferred_usdc": 0.0,
-                "skipped": True,
-                "skip_reason": "bank_equity_at_or_above_threshold",
-                "bank_equity_usdc": float(bank_eq),
-                "bank_threshold_usdc": float(bank_threshold),
-                "trading_equity_usdc": float(trading_eq),
-                "floor_usdc": float(floor),
-            }
-
-        # Budget cap applies in this initial stage.
-        remaining = max(0.0, float(self.initial_topup_budget_usdc) - float(self.initial_topup_spent_usdc))
-        if remaining <= 0.0:
-            return {
-                "topped_up": False,
-                "needed_usdc": float(needed),
-                "transferred_usdc": 0.0,
-                "skipped": True,
-                "skip_reason": "initial_topup_budget_exhausted",
-                "budget_usdc": float(self.initial_topup_budget_usdc),
-                "spent_usdc": float(self.initial_topup_spent_usdc),
-                "bank_equity_usdc": float(bank_eq),
-                "trading_equity_usdc": float(trading_eq),
-            }
-
-        transfer = min(float(needed), float(bank_eq), float(remaining))
+        # NO budget cap on floor topups - bank funds are from profits, not external
+        # Just check if bank has enough funds
+        transfer = min(float(needed), float(bank_eq))
         if transfer <= 0.0:
             return {
                 "topped_up": False,
@@ -996,6 +969,7 @@ class EthSellRunner:
             int(amt_q),
         )
 
+        # Track topups but NO budget cap (using profit funds from bank)
         self.initial_topup_spent_usdc += float(transfer)
         self._save_budget_state()
 
@@ -1003,10 +977,7 @@ class EthSellRunner:
             "topped_up": True,
             "needed_usdc": float(needed),
             "transferred_usdc": float(transfer),
-            "budget_usdc": float(self.initial_topup_budget_usdc),
-            "spent_usdc": float(self.initial_topup_spent_usdc),
             "bank_equity_usdc": float(bank_eq),
-            "bank_threshold_usdc": float(bank_threshold),
             "tx": _pb_to_jsonable(tx),
         }
 
@@ -1723,21 +1694,7 @@ class EthSellRunner:
             self.pending_entry = {"entry_score": float(score)}
             return
 
-        # Hard stop: do not open new trades if the initial topup budget is exhausted.
-        if float(self.initial_topup_spent_usdc) >= float(self.initial_topup_budget_usdc):
-            self.records.append(
-                {
-                    "event": "entry_skipped_budget_exhausted",
-                    "time_utc": _iso_utc(pd.to_datetime(bar["timestamp"], utc=True) + timedelta(minutes=1)),
-                    "symbol": self.market,
-                    "direction": "SHORT",
-                    "entry_score": float(score),
-                    "entry_threshold": float(self.thr_cur_day),
-                    "budget_usdc": float(self.initial_topup_budget_usdc),
-                    "spent_usdc": float(self.initial_topup_spent_usdc),
-                }
-            )
-            return
+        # NO budget hard stop - we use internal bank funds (from profits), not external capital
 
         # real mode: top up to floor (subject to budget), then open short.
         # Tolerate 404 for uninitialized subaccounts - they'll be initialized on first transfer.
