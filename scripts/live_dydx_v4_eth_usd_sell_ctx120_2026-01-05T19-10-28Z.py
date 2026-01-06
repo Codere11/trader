@@ -874,10 +874,12 @@ class EthSellRunner:
     def seed_thresholds_from_backfill(self) -> None:
         """Seed prior_scores from the current warm backfill bars so we can trade immediately."""
         if self.bars is None or self.bars.empty:
+            print(f"seed_thresholds: bars is None or empty (len={len(self.bars) if self.bars is not None else 0})")
             return
 
         self._recompute_feature_sources()
         if self.base is None or self.ctx is None:
+            print(f"seed_thresholds: feature sources failed after _recompute_feature_sources (base={self.base is not None}, ctx={self.ctx is not None}, bars_len={len(self.bars)})")
             return
 
         ts = pd.to_datetime(self.bars["timestamp"], utc=True)
