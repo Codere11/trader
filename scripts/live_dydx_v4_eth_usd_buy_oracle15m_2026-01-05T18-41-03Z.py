@@ -1866,9 +1866,12 @@ def main() -> None:
     # Safety: on startup in real mode, flatten any leftover position and ensure floor.
     if str(args.trade_mode).lower() == "real":
         runner.reconcile_startup()
-        # Top up to floor from bank on startup (ignores budget limit if bank > threshold)
-        topup_result = loop.run_until_complete(_ensure_trading_floor(clients, cfg, budget=runner.topup_budget))
-        print(f"Startup topup: {topup_result}")
+        # Top up to floor from bank on startup (tolerate 404 if subaccount not initialized yet)
+        try:
+            topup_result = loop.run_until_complete(_ensure_trading_floor(clients, cfg, budget=runner.topup_budget))
+            print(f"Startup topup: {topup_result}")
+        except Exception as e:
+            print(f"Startup topup skipped (subaccount may need manual init): {e}")
 
     # Warm backfill (required for stable features). If it fails and seed_csv exists, use it.
     bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))
