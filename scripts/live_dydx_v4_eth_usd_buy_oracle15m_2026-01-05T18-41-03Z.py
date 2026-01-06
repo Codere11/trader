@@ -785,7 +785,14 @@ def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, A
 
     def on_open(ws):
         try:
-            msg = {"type": "subscribe", "channel": "v4_candles", "id": str(market).upper(), "resolution": "1MIN"}
+            # Match BTC runner: explicitly request non-batched stream.
+            msg = {
+                "type": "subscribe",
+                "channel": "v4_candles",
+                "id": str(market).upper(),
+                "resolution": "1MIN",
+                "batched": False,
+            }
             ws.send(json.dumps(msg))
         except Exception:
             pass
@@ -810,34 +817,41 @@ def _run_ws_candles(*, ws_url: str, market: str, out_q: "queue.Queue[Dict[str, A
         if t == "connected":
             return
 
+        def _emit(candle: Dict[str, Any]) -> None:
+            closed = agg.ingest(candle)
+            if closed is None:
+                return
+            try:
+                out_q.put_nowait(closed)
+            except queue.Full:
+                pass
+
+        def _emit_many(candles: List[Any]) -> None:
+            # Snapshot can be newest-first; enforce chronological order.
+            try:
+                candles2 = sorted([c for c in candles if isinstance(c, dict)], key=lambda c: c.get("startedAt") or "")
+            except Exception:
+                candles2 = [c for c in candles if isinstance(c, dict)]
+            for c in candles2:
+                _emit(c)
+
         if t == "subscribed":
-            candles = ((msg.get("contents") or {}).get("candles") or [])
-            if isinstance(candles, list):
-                try:
-                    candles = sorted(candles, key=lambda c: (c or {}).get("startedAt") or "")
-                except Exception:
-                    pass
-                for c in candles:
-                    if not isinstance(c, dict):
-                        continue
-                    closed = agg.ingest(c)
-                    if closed is None:
-                        continue
-                    try:
-                        out_q.put_nowait(closed)
-                    except queue.Full:
-                        pass
+            contents = (msg.get("contents") or {})
+            if isinstance(contents, dict):
+                candles = contents.get("candles")
+                if isinstance(candles, list):
+                    _emit_many(candles)
             return
 
         if t == "channel_data" and msg.get("channel") == "v4_candles":
-            c = (msg.get("contents") or {})
-            if isinstance(c, dict):
-                closed = agg.ingest(c)
-                if closed is not None:
-                    try:
-                        out_q.put_nowait(closed)
-                    except queue.Full:
-                        pass
+            contents = (msg.get("contents") or {})
+            if isinstance(contents, dict):
+                candles = contents.get("candles")
+                if isinstance(candles, list):
+                    # Some servers send batched updates even when not requested.
+                    _emit_many(candles)
+                elif "startedAt" in contents:
+                    _emit(contents)
             return
 
         if t == "error":
