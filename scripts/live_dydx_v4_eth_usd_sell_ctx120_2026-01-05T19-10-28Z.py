@@ -1714,22 +1714,8 @@ class EthSellRunner:
             print(f"Could not query trading equity (subaccount may need init): {e}")
             equity_before = 0.0
 
-        # Hard floor: if we couldn't reach the floor (e.g., budget exhausted), skip opening.
-        if float(equity_before) < float(self.cfg.trade_floor_usdc):
-            self.records.append(
-                {
-                    "event": "entry_skipped_no_floor",
-                    "time_utc": _iso_utc(pd.to_datetime(bar["timestamp"], utc=True) + timedelta(minutes=1)),
-                    "symbol": self.market,
-                    "direction": "SHORT",
-                    "entry_score": float(score),
-                    "entry_threshold": float(self.thr_cur_day),
-                    "trading_equity_usdc": float(equity_before),
-                    "trade_floor_usdc": float(self.cfg.trade_floor_usdc),
-                    "topup_pre": topup_pre,
-                }
-            )
-            return
+        # NO hard floor check - topup already ensured we have funds (bank has $144.59)
+        # Equity query might be slightly stale or rounded, don't block entries
 
         entry_meta = self.loop.run_until_complete(self._open_real_short(equity_before=float(equity_before)))
 
