@@ -181,7 +181,7 @@ services:
       - "127.0.0.1:8003:8003"
     command:
       - python3
-      - scripts/live_dydx_v4_eth_usd_sell_simple_2026-01-06T22-16-46Z.py
+      - scripts/live_dydx_v4_eth_usd_sell_simple_2026-01-08T07-47-09Z.py
       - --trade-mode
       - real
       - --yes-really
