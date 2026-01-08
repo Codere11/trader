@@ -173,6 +173,8 @@ services:
       DYDX_USE_MARGIN_FRAC: ${DYDX_USE_MARGIN_FRAC:-1.0}
       DYDX_LEVERAGE_SAFETY_FRAC: ${DYDX_LEVERAGE_SAFETY_FRAC:-1.0}
       ETH_SELL_ENTRY_THRESHOLD: ${ETH_SELL_ENTRY_THRESHOLD:-0.39}
+      ETH_SELL_SPIKE_GUARD_ABS_RET_1M_PCT: ${ETH_SELL_SPIKE_GUARD_ABS_RET_1M_PCT:-0.25}
+      ETH_SELL_SPIKE_GUARD_LOOKBACK_BARS: ${ETH_SELL_SPIKE_GUARD_LOOKBACK_BARS:-5}
     volumes:
       - ./data/live_dydx/eth_sell:/app/data/live_dydx/eth_sell
       - ./data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:/app/data/entry_regressor_oracle15m_sell_ctx120_weighted_oracleentry5m_2026-01-04T22-45-20Z:ro

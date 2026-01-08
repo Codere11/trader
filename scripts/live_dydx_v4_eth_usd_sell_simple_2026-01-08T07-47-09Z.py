@@ -719,6 +719,16 @@ class EthSellSimpleRunner:
         self.trade_mode = str(trade_mode).lower()
         self.entry_threshold = float(entry_threshold)
 
+        # Spike-guard: skip entries during/after very spiky 1m bars (empirically filters bad whipsaw entries)
+        try:
+            self.spike_guard_abs_ret_1m_pct = float(os.getenv("ETH_SELL_SPIKE_GUARD_ABS_RET_1M_PCT", "0.25"))
+        except Exception:
+            self.spike_guard_abs_ret_1m_pct = 0.25
+        try:
+            self.spike_guard_lookback_bars = int(os.getenv("ETH_SELL_SPIKE_GUARD_LOOKBACK_BARS", "5"))
+        except Exception:
+            self.spike_guard_lookback_bars = 5
+
         self.log_every = int(log_every)
 
         self.hold_min = int(hold_min)
@@ -811,6 +821,29 @@ class EthSellSimpleRunner:
         self.features.recompute()
 
         return int(len(self.bars) - 1)
+
+    def _recent_spike_abs_ret_1m_pct(self, i: int) -> Optional[float]:
+        """Max abs 1m return (%) over last N bars ending at i (inclusive)."""
+        if self.bars is None or self.bars.empty:
+            return None
+
+        i = int(i)
+        lookback = int(getattr(self, "spike_guard_lookback_bars", 5) or 0)
+        if lookback <= 0 or i <= 0:
+            return None
+
+        closes = pd.to_numeric(self.bars["close"], errors="coerce")
+        ret_1m_pct = (closes / closes.shift(1) - 1.0) * 100.0
+
+        win = ret_1m_pct.iloc[max(0, i - lookback + 1) : i + 1]
+        if int(win.count()) < int(lookback):
+            return None
+
+        try:
+            v = float(win.abs().max())
+        except Exception:
+            return None
+        return v if np.isfinite(v) else None
 
     def _entry_score_at(self, i: int) -> Optional[float]:
         feat = self.features.feature_map_at(i)
@@ -1279,7 +1312,16 @@ class EthSellSimpleRunner:
             }
         )
 
-    def _audit_entry_decision(self, *, bar: Mapping[str, Any], score: float, threshold: float, action: str, i: int) -> None:
+    def _audit_entry_decision(
+        self,
+        *,
+        bar: Mapping[str, Any],
+        score: float,
+        threshold: float,
+        action: str,
+        i: int,
+        extra: Optional[Mapping[str, Any]] = None,
+    ) -> None:
         t0 = pd.to_datetime(bar["timestamp"], utc=True)
         t1 = t0 + timedelta(minutes=1)
 
@@ -1287,28 +1329,30 @@ class EthSellSimpleRunner:
         feature_names = list(self.entry.feature_cols)
         feature_values = [_finite_or_none(feat.get(c)) for c in feature_names]
 
-        self.audit.write(
-            {
-                "kind": KIND_ENTRY_DECISION,
-                "symbol": self.market,
-                "decision_time_utc": t1.to_pydatetime().isoformat(),
-                "bar_open_time_utc": t0.to_pydatetime().isoformat(),
-                "bar_close_time_utc": t1.to_pydatetime().isoformat(),
-                "score": float(score),
-                "threshold": float(threshold),
-                "action": str(action),
-                "planned_entry_time_utc": t1.to_pydatetime().isoformat(),
-                "policy": "fixed_threshold_next_open",
-                "feature_names": feature_names,
-                "feature_values": feature_values,
-                "model": {
-                    "role": "entry",
-                    "artifact": str(self.entry.artifact),
-                    "created_utc": str(self.entry.created_utc or "unknown"),
-                    "features": feature_names,
-                },
-            }
-        )
+        payload: Dict[str, Any] = {
+            "kind": KIND_ENTRY_DECISION,
+            "symbol": self.market,
+            "decision_time_utc": t1.to_pydatetime().isoformat(),
+            "bar_open_time_utc": t0.to_pydatetime().isoformat(),
+            "bar_close_time_utc": t1.to_pydatetime().isoformat(),
+            "score": float(score),
+            "threshold": float(threshold),
+            "action": str(action),
+            "planned_entry_time_utc": t1.to_pydatetime().isoformat(),
+            "policy": "fixed_threshold_next_open",
+            "feature_names": feature_names,
+            "feature_values": feature_values,
+            "model": {
+                "role": "entry",
+                "artifact": str(self.entry.artifact),
+                "created_utc": str(self.entry.created_utc or "unknown"),
+                "features": feature_names,
+            },
+        }
+        if extra:
+            payload.update(dict(extra))
+
+        self.audit.write(payload)
 
     def _audit_trade_closed(
         self,
@@ -1577,12 +1621,41 @@ class EthSellSimpleRunner:
         thr = float(self.entry_threshold)
         action = "enter" if float(score) >= float(thr) else "hold"
 
+        recent_spike_pct = self._recent_spike_abs_ret_1m_pct(int(i))
+        spike_meta: Dict[str, Any] = {
+            "recent_spike_pct": _finite_or_none(recent_spike_pct),
+            "spike_guard_abs_ret_1m_pct": float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.25)),
+            "spike_guard_lookback_bars": int(getattr(self, "spike_guard_lookback_bars", 5)),
+        }
+
+        # Spike-guard filter
+        if action == "enter":
+            thr_spike = float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.0) or 0.0)
+            if thr_spike > 0.0 and recent_spike_pct is not None and float(recent_spike_pct) > float(thr_spike):
+                spike_meta["spike_guard_triggered"] = True
+                spike_meta["spike_guard_reason"] = "recent_spike_gt_threshold"
+                print(
+                    f"{_iso_utc(t1)} SPIKE_GUARD hold: recent_spike_pct={float(recent_spike_pct):.3f}% > {float(thr_spike):.3f}% (lookback={int(self.spike_guard_lookback_bars)} bars)"
+                )
+                action = "hold"
+
         if int(getattr(self, "log_every", 0) or 0) > 0:
             if action == "enter" or (int(i) % int(self.log_every) == 0):
-                print(f"{_iso_utc(t1)} entry_decision score={float(score):.6f} thr={float(thr):.6f} action={action}")
+                rs = spike_meta.get("recent_spike_pct")
+                rs_s = "None" if rs is None else f"{float(rs):.3f}%"
+                print(
+                    f"{_iso_utc(t1)} entry_decision score={float(score):.6f} thr={float(thr):.6f} action={action} recent_spike={rs_s}"
+                )
 
         try:
-            self._audit_entry_decision(bar=bar, score=float(score), threshold=float(thr), action=str(action), i=int(i))
+            self._audit_entry_decision(
+                bar=bar,
+                score=float(score),
+                threshold=float(thr),
+                action=str(action),
+                i=int(i),
+                extra=spike_meta,
+            )
         except Exception as e:
             print("audit_entry_decision_failed:", e)
 
@@ -1776,6 +1849,13 @@ def main() -> None:
         print("Trade mode:", args.trade_mode)
         print("Subaccounts: trading=", int(cfg.subaccount_trading), " bank=", int(cfg.subaccount_bank))
         print("Entry threshold:", float(args.entry_threshold))
+        print(
+            "Spike guard: abs(ret_1m_pct) <=",
+            float(getattr(runner, "spike_guard_abs_ret_1m_pct", 0.25)),
+            "over",
+            int(getattr(runner, "spike_guard_lookback_bars", 5)),
+            "bars",
+        )
         print("Exit policy: tau=", float(args.exit_gap_tau), " min_exit_k=", int(args.exit_gap_min_exit_k), " hold_min=", int(args.hold_min))
         print("Audit:", str(audit_path))
         print("Out dir:", str(out_dir))
