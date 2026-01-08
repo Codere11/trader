@@ -23,10 +23,10 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -42,6 +42,7 @@ from contracts.v1 import (
     KIND_MARKET_BAR_1M_CLOSED,
     KIND_RUN_META,
     KIND_TRADE_CLOSED,
+    KIND_TRADE_MODE_SWITCH,
 )
 
 from dydx_adapter import load_dotenv
@@ -100,6 +101,51 @@ def net_mult_sell(entry_px: float, exit_px: float, fee_side: float) -> float:
 
 def net_ret_pct_sell(entry_px: float, exit_px: float, fee_side: float) -> float:
     return float((net_mult_sell(entry_px, exit_px, fee_side) - 1.0) * 100.0)
+
+
+# -----------------
+# Auto paper/real switching (EOD decision)
+# -----------------
+
+
+AUTO_EOD_DECISION_MINUTES_BEFORE_MIDNIGHT = 5
+
+
+def _day_str(d: date) -> str:
+    return d.isoformat()
+
+
+def _atomic_write_json(path: Path, obj: Mapping[str, Any]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(dict(obj), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _eod_cutoff_time_utc(*, minutes_before_midnight: int) -> Tuple[int, int]:
+    """Return (hour, minute) for the daily evaluation time.
+
+    Example: minutes_before_midnight=5 -> 23:55.
+
+    NOTE: We intentionally clamp to 1..59 to avoid invalid times like 23:60.
+    """
+
+    mbm = int(minutes_before_midnight)
+    mbm = max(1, min(59, mbm))
+    cutoff_minute = 60 - mbm
+    return (23, int(cutoff_minute))
 
 
 # ---- dYdX helpers (copied from the existing ETH sell runner for consistency) ----
@@ -370,12 +416,15 @@ def _run_ws_candles(
                     candles = sorted(candles, key=lambda c: c.get("startedAt") or "")
                 except Exception:
                     pass
-                for c in candles:
-                    closed = asm.ingest(c)
-                    if closed is not None:
-                        ts = closed.get("timestamp")
-                        print(f"[WS] Closed bar from initial batch: {ts}")
-                        out_q.put(closed)
+
+                # IMPORTANT:
+                # Treat the initial snapshot as a SEED only.
+                # Do NOT emit closed bars from the snapshot, otherwise the runner may "time-travel"
+                # and paper-trade over historical candles immediately on startup.
+                if candles:
+                    last = candles[-1]
+                    asm.ingest(last)
+                    print(f"[WS] Seeded from latest snapshot candle startedAt={last.get('startedAt')}; will emit closed bars from realtime updates only")
                 return
 
             if t == "channel_data" and msg.get("channel") == "v4_candles":
@@ -504,12 +553,16 @@ def load_sell_exit_gap_model(path: Path) -> SellExitGapModel:
 @dataclass
 class OpenTrade:
     trade_id: str
-    trade_mode: str
+    trade_mode: str  # "paper" or "real"
     entry_time_utc: str
     entry_price: float
     entry_score: float
     entry_threshold: float
     size_base: float
+
+    # Real-mode bookkeeping (best-effort; used for EOD switching decisions)
+    entry_fill_price: Optional[float] = None
+    entry_fill_size_base: Optional[float] = None
 
     mins_in_trade: int = 0
     ret_hist: List[float] = field(default_factory=list)
@@ -716,8 +769,67 @@ class EthSellSimpleRunner:
         self.entry = entry
         self.exit_gap = exit_gap
 
-        self.trade_mode = str(trade_mode).lower()
+        # trade_mode_cfg:
+        # - paper: never place real orders
+        # - real: always place real orders
+        # - auto: decide daily (EOD-5m) whether *tomorrow* is paper or real (per DO_NOT_TOUCH.txt)
+        self.trade_mode_cfg = str(trade_mode).lower()
+        self.trade_mode = "paper" if self.trade_mode_cfg == "auto" else self.trade_mode_cfg
+
         self.entry_threshold = float(entry_threshold)
+
+        # Auto mode persisted state (per-market + subaccounts)
+        st = str(market).lower().replace("-", "_")
+        self.trade_mode_state_path = Path(out_dir) / f"trade_mode_state_{st}_sell_tr{int(cfg.subaccount_trading)}_bank{int(cfg.subaccount_bank)}.json"
+        self._planned_mode_for_day_utc: Optional[str] = None  # YYYY-MM-DD
+        self._planned_mode: Optional[str] = None  # "paper"|"real"
+        self._last_decision_day_utc: Optional[str] = None
+
+        # Cold-start guard:
+        # - While we have NOT yet reached a scheduled EOD decision time since startup,
+        #   we stay in PAPER and do NOT schedule tomorrow based on partial info.
+        self._auto_cold_start: bool = False
+        self._auto_next_eval_day_utc: Optional[str] = None  # YYYY-MM-DD
+        self._auto_startup_utc: Optional[str] = None
+
+        # Performance trackers (best-effort, used for EOD decisions)
+        self._cur_day_utc: Optional[str] = None  # YYYY-MM-DD (based on bar close time)
+        self._paper_cum_mult: float = 1.0
+        self._paper_day_start_mult: float = 1.0
+
+        # Real mode (IGNORE BANK):
+        # - primary decision signal: trade-based PnL for THIS strategy (real fills + mark-to-market) (B)
+        # - diagnostic/fallback: trading subaccount equity delta (A)
+        self._real_day_start_trading_equity_usdc: Optional[float] = None
+        self._real_day_trade_realized_pnl_usdc: float = 0.0  # includes entry+exit fees
+        self._real_day_open_unrealized_base_usdc: float = 0.0
+
+        self._liquidation_today: bool = False
+
+        self._load_trade_mode_state()
+
+        if self.trade_mode_cfg == "auto":
+            # Always cold-start on process startup: stay PAPER until the next scheduled EOD evaluation.
+            # This matches the requirement: we don't assume we know if "today" is good/bad until
+            # we reach an evaluation point.
+            self._auto_cold_start = True
+            now = datetime.now(timezone.utc)
+            hh, mm = _eod_cutoff_time_utc(minutes_before_midnight=AUTO_EOD_DECISION_MINUTES_BEFORE_MIDNIGHT)
+            cutoff = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            next_eval_day = now.date() if now < cutoff else (now.date() + timedelta(days=1))
+            self._auto_next_eval_day_utc = _day_str(next_eval_day)
+            self._auto_startup_utc = now.isoformat().replace("+00:00", "Z")
+
+            # Force PAPER during cold-start window.
+            self.trade_mode = "paper"
+            self._save_trade_mode_state()
+
+        if self.trade_mode_cfg == "auto":
+            # Log the initial effective mode.
+            try:
+                self._audit_trade_mode_switch(from_mode="auto", to_mode=str(self.trade_mode), reason="auto_mode_startup")
+            except Exception:
+                pass
 
         # Spike-guard: skip entries during/after very spiky 1m bars (empirically filters bad whipsaw entries)
         try:
@@ -769,6 +881,319 @@ class EthSellSimpleRunner:
         self._load_budget_state()
 
         self.last_closed_wall = time.time()
+
+    # -----------------
+    # Auto mode: persistence + accounting
+    # -----------------
+
+    def _audit_trade_mode_switch(self, *, from_mode: str, to_mode: str, reason: str, extra: Optional[Mapping[str, Any]] = None) -> None:
+        payload: Dict[str, Any] = {
+            "kind": KIND_TRADE_MODE_SWITCH,
+            "symbol": self.market,
+            "from_trade_mode": str(from_mode),
+            "to_trade_mode": str(to_mode),
+            "reason": str(reason),
+        }
+        if extra:
+            payload.update(dict(extra))
+        self.audit.write(payload)
+
+    def _load_trade_mode_state(self) -> None:
+        obj = _load_json(self.trade_mode_state_path)
+
+        # Planned mode for a specific UTC day.
+        self._planned_mode_for_day_utc = obj.get("planned_for_day_utc")
+        self._planned_mode = obj.get("planned_mode")
+        self._last_decision_day_utc = obj.get("last_decision_day_utc")
+
+        # Performance accumulators (best-effort; continue across restarts)
+        try:
+            self._paper_cum_mult = float(obj.get("paper_cum_mult", 1.0))
+        except Exception:
+            self._paper_cum_mult = 1.0
+        try:
+            self._paper_day_start_mult = float(obj.get("paper_day_start_mult", 1.0))
+        except Exception:
+            self._paper_day_start_mult = 1.0
+
+        try:
+            v = obj.get("real_day_start_trading_equity_usdc")
+            self._real_day_start_trading_equity_usdc = None if v is None else float(v)
+            if self._real_day_start_trading_equity_usdc is not None and not np.isfinite(float(self._real_day_start_trading_equity_usdc)):
+                self._real_day_start_trading_equity_usdc = None
+        except Exception:
+            self._real_day_start_trading_equity_usdc = None
+
+        try:
+            self._real_day_trade_realized_pnl_usdc = float(obj.get("real_day_trade_realized_pnl_usdc", 0.0))
+            if not np.isfinite(float(self._real_day_trade_realized_pnl_usdc)):
+                self._real_day_trade_realized_pnl_usdc = 0.0
+        except Exception:
+            self._real_day_trade_realized_pnl_usdc = 0.0
+
+        try:
+            self._real_day_open_unrealized_base_usdc = float(obj.get("real_day_open_unrealized_base_usdc", 0.0))
+            if not np.isfinite(float(self._real_day_open_unrealized_base_usdc)):
+                self._real_day_open_unrealized_base_usdc = 0.0
+        except Exception:
+            self._real_day_open_unrealized_base_usdc = 0.0
+
+        self._cur_day_utc = obj.get("cur_day_utc")
+        self._liquidation_today = bool(obj.get("liquidation_today", False))
+
+        # Cold-start guard (optional; absent in older state files)
+        self._auto_cold_start = bool(obj.get("auto_cold_start", False))
+        self._auto_next_eval_day_utc = obj.get("auto_next_eval_day_utc")
+        self._auto_startup_utc = obj.get("auto_startup_utc")
+
+        # If we have a plan for *today*, apply it; otherwise default to paper.
+        if self.trade_mode_cfg == "auto":
+            today = _day_str(datetime.now(timezone.utc).date())
+            if isinstance(self._planned_mode_for_day_utc, str) and self._planned_mode_for_day_utc == today and str(self._planned_mode) in {"paper", "real"}:
+                self.trade_mode = str(self._planned_mode)
+            else:
+                self.trade_mode = "paper"
+
+    def _save_trade_mode_state(self) -> None:
+        try:
+            _atomic_write_json(
+                self.trade_mode_state_path,
+                {
+                    "updated_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "trade_mode_cfg": str(self.trade_mode_cfg),
+                    "trade_mode_effective": str(self.trade_mode),
+                    "planned_for_day_utc": self._planned_mode_for_day_utc,
+                    "planned_mode": self._planned_mode,
+                    "last_decision_day_utc": self._last_decision_day_utc,
+                    "cur_day_utc": self._cur_day_utc,
+                    "paper_cum_mult": float(self._paper_cum_mult),
+                    "paper_day_start_mult": float(self._paper_day_start_mult),
+                    "real_day_start_trading_equity_usdc": self._real_day_start_trading_equity_usdc,
+                    "real_day_trade_realized_pnl_usdc": float(self._real_day_trade_realized_pnl_usdc),
+                    "real_day_open_unrealized_base_usdc": float(self._real_day_open_unrealized_base_usdc),
+                    "liquidation_today": bool(self._liquidation_today),
+                    "auto_cold_start": bool(self._auto_cold_start),
+                    "auto_next_eval_day_utc": self._auto_next_eval_day_utc,
+                    "auto_startup_utc": self._auto_startup_utc,
+                },
+            )
+        except Exception:
+            pass
+
+    def _paper_effective_mult(self, *, cur_close_px: float) -> float:
+        m = float(self._paper_cum_mult)
+        tr = self.open_trade
+        if tr is None or str(tr.trade_mode).lower() != "paper":
+            return m
+        # Mark-to-market the currently open paper trade.
+        try:
+            open_mult = float(net_mult_sell(float(tr.entry_price), float(cur_close_px), float(self.fee_side)))
+        except Exception:
+            open_mult = 1.0
+        return float(m) * float(open_mult)
+
+    def _paper_day_ret_frac(self, *, cur_close_px: float) -> float:
+        denom = max(1e-12, float(self._paper_day_start_mult))
+        return float(self._paper_effective_mult(cur_close_px=float(cur_close_px)) / denom - 1.0)
+
+    async def _get_trading_equity_usdc(self) -> float:
+        """Trading subaccount equity (USDC). Bank is intentionally ignored."""
+        return float(
+            await _get_subaccount_equity_usdc(
+                self.clients,
+                address=self.cfg.address,
+                subaccount_number=int(self.cfg.subaccount_trading),
+            )
+        )
+
+    def _trading_equity_usdc_best_effort(self) -> Optional[float]:
+        try:
+            v = float(self.loop.run_until_complete(self._get_trading_equity_usdc()))
+        except Exception:
+            return None
+        return v if np.isfinite(v) else None
+
+    def _real_open_unrealized_pnl_usdc(self, *, cur_close_px: float) -> float:
+        tr = self.open_trade
+        if tr is None or str(tr.trade_mode).lower() != "real":
+            return 0.0
+        try:
+            entry_px = float(tr.entry_fill_price or tr.entry_price)
+            sz = float(tr.entry_fill_size_base or tr.size_base)
+            px = float(cur_close_px)
+            if not (np.isfinite(entry_px) and np.isfinite(sz) and np.isfinite(px)):
+                return 0.0
+            # Short PnL in quote: size * (entry - current)
+            return float(sz) * float(entry_px - px)
+        except Exception:
+            return 0.0
+
+    def _real_trade_based_day_pnl_usdc(self, *, cur_close_px: float) -> float:
+        # Realized PnL + (unrealized_now - unrealized_baseline_at_day_start)
+        return float(self._real_day_trade_realized_pnl_usdc) + float(self._real_open_unrealized_pnl_usdc(cur_close_px=float(cur_close_px)) - float(self._real_day_open_unrealized_base_usdc))
+
+    def _roll_day_if_needed(self, *, bar_close_time_utc: datetime, cur_close_px: float) -> None:
+        day_s = _day_str(bar_close_time_utc.date())
+        if self._cur_day_utc == day_s:
+            return
+
+        prev_mode = str(self.trade_mode)
+
+        # Apply planned mode if it is for this new day.
+        if self.trade_mode_cfg == "auto":
+            if isinstance(self._planned_mode_for_day_utc, str) and self._planned_mode_for_day_utc == day_s and str(self._planned_mode) in {"paper", "real"}:
+                self.trade_mode = str(self._planned_mode)
+            else:
+                # No plan -> PAPER (safe default).
+                self.trade_mode = "paper"
+
+            # During cold-start window we ALWAYS force PAPER, regardless of any saved plan.
+            if bool(self._auto_cold_start):
+                self.trade_mode = "paper"
+
+        self._cur_day_utc = day_s
+        self._liquidation_today = False
+
+        # Reset day baselines using current mark-to-market values.
+        self._paper_day_start_mult = float(self._paper_effective_mult(cur_close_px=float(cur_close_px)))
+
+        # Real mode baselines (bank ignored):
+        # - trading equity at day start (diagnostic/fallback)
+        # - open-trade unrealized PnL baseline at day start (so trades spanning midnight don't leak pnl across days)
+        self._real_day_start_trading_equity_usdc = self._trading_equity_usdc_best_effort()
+        self._real_day_trade_realized_pnl_usdc = 0.0
+        self._real_day_open_unrealized_base_usdc = float(self._real_open_unrealized_pnl_usdc(cur_close_px=float(cur_close_px)))
+
+        self._save_trade_mode_state()
+
+        # Emit audit event if the effective mode actually changed.
+        if self.trade_mode_cfg == "auto" and prev_mode != str(self.trade_mode):
+            try:
+                self._audit_trade_mode_switch(
+                    from_mode=str(prev_mode),
+                    to_mode=str(self.trade_mode),
+                    reason=f"day_roll_to_{day_s}",
+                    extra={"day_utc": str(day_s)},
+                )
+            except Exception:
+                pass
+
+    def _maybe_decide_tomorrow_mode(self, *, bar_close_time_utc: datetime, cur_close_px: float) -> None:
+        if self.trade_mode_cfg != "auto":
+            return
+
+        today_s = _day_str(bar_close_time_utc.date())
+        if self._last_decision_day_utc == today_s:
+            return
+
+        # Cold-start rule: do not decide until we've reached the first scheduled EOD evaluation time.
+        if bool(self._auto_cold_start) and isinstance(self._auto_next_eval_day_utc, str):
+            if str(today_s) != str(self._auto_next_eval_day_utc):
+                return
+
+        hh, mm = _eod_cutoff_time_utc(minutes_before_midnight=AUTO_EOD_DECISION_MINUTES_BEFORE_MIDNIGHT)
+        if (int(bar_close_time_utc.hour), int(bar_close_time_utc.minute)) < (int(hh), int(mm)):
+            return
+
+        # Compute performance so far for TODAY, using the mode we actually traded today.
+        perf_sign = 0.0
+        perf_meta: Dict[str, Any] = {
+            "decision_time_utc": bar_close_time_utc.isoformat().replace("+00:00", "Z"),
+            "based_on_day_utc": today_s,
+            "based_on_trade_mode": str(self.trade_mode),
+        }
+
+        if str(self.trade_mode) == "paper":
+            day_ret = float(self._paper_day_ret_frac(cur_close_px=float(cur_close_px)))
+            perf_sign = float(day_ret)
+            perf_meta.update({"paper_day_ret_pct": float(day_ret * 100.0)})
+        else:
+            # Combined A+B (bank ignored):
+            # - Use trade-based PnL (B) as the decision signal (immune to manual deposits/withdrawals).
+            # - Also compute trading-equity delta (A) for diagnostics.
+            trade_pnl = float(self._real_trade_based_day_pnl_usdc(cur_close_px=float(cur_close_px)))
+
+            eq_now = self._trading_equity_usdc_best_effort()
+            eq0 = self._real_day_start_trading_equity_usdc
+            eq_delta = None
+            if eq_now is not None and eq0 is not None:
+                eq_delta = float(eq_now - eq0)
+
+            if bool(self._liquidation_today):
+                trade_pnl = -abs(float(trade_pnl)) - 1e-9
+
+            perf_sign = float(trade_pnl)
+            perf_meta.update(
+                {
+                    "real_trade_based_day_pnl_usdc": float(trade_pnl),
+                    "real_trade_realized_pnl_usdc": float(self._real_day_trade_realized_pnl_usdc),
+                    "real_open_unrealized_pnl_usdc": float(self._real_open_unrealized_pnl_usdc(cur_close_px=float(cur_close_px))),
+                    "real_open_unrealized_base_usdc": float(self._real_day_open_unrealized_base_usdc),
+                    "trading_equity_now_usdc": eq_now,
+                    "trading_equity_day_start_usdc": eq0,
+                    "trading_equity_delta_usdc": eq_delta,
+                    "external_flow_est_usdc": (float(eq_delta) - float(trade_pnl)) if eq_delta is not None else None,
+                    "liquidation_today": bool(self._liquidation_today),
+                }
+            )
+
+        tomorrow_s = _day_str((bar_close_time_utc.date() + timedelta(days=1)))
+        tomorrow_mode = "real" if float(perf_sign) > 0.0 else "paper"
+
+        self._planned_mode_for_day_utc = str(tomorrow_s)
+        self._planned_mode = str(tomorrow_mode)
+        self._last_decision_day_utc = str(today_s)
+
+        # First evaluation completed after cold start → normal behavior from now on.
+        if bool(self._auto_cold_start):
+            self._auto_cold_start = False
+            self._auto_next_eval_day_utc = None
+
+        # Persist immediately.
+        self._save_trade_mode_state()
+
+        print(
+            f"{_iso_utc(bar_close_time_utc)} AUTO_EOD_DECISION today={today_s} mode_today={self.trade_mode} perf_sign={perf_sign:.6f} -> tomorrow={tomorrow_s} mode_tomorrow={tomorrow_mode}"
+        )
+
+        # Audit as an informational switch (auto -> auto) so it lands in the same log stream.
+        try:
+            self._audit_trade_mode_switch(from_mode="auto", to_mode="auto", reason="auto_eod_decision_saved", extra={"tomorrow_day_utc": tomorrow_s, "tomorrow_mode": tomorrow_mode, **perf_meta})
+        except Exception:
+            pass
+
+    def reconcile_startup(self) -> None:
+        """Best-effort safety: if a prior run left an open position, attempt to close it reduce-only.
+
+        This mirrors the behavior in the ctx120 runner.
+        """
+
+        if str(self.trade_mode_cfg) not in {"real", "auto"}:
+            return
+
+        try:
+            live_sz = float(
+                self.loop.run_until_complete(
+                    _get_open_position_size_base(
+                        self.clients,
+                        address=self.cfg.address,
+                        subaccount_number=int(self.cfg.subaccount_trading),
+                        market=self.market,
+                    )
+                )
+            )
+        except Exception as e:
+            print(f"reconcile_startup: could not fetch position: {e}")
+            return
+
+        if abs(float(live_sz)) <= 0.0:
+            return
+
+        print(f"Startup: detected existing open position; closing reduce-only (size_base={abs(float(live_sz))})...")
+        try:
+            self.loop.run_until_complete(self._close_real_short(size_base=float(abs(float(live_sz)))))
+        except Exception as e:
+            print("Startup close failed:", e)
 
     def _load_budget_state(self) -> None:
         try:
@@ -1408,12 +1833,148 @@ class EthSellSimpleRunner:
         t0 = pd.to_datetime(self.bars.iloc[i]["timestamp"], utc=True)
         t1 = t0 + timedelta(minutes=1)
 
-        # Exit/update if in trade
-        if self.open_trade is not None:
-            tr = self.open_trade
+        # Day-roll should happen BEFORE we do any trading logic.
+        try:
+            self._roll_day_if_needed(bar_close_time_utc=t1.to_pydatetime(), cur_close_px=float(bar["close"]))
+        except Exception:
+            pass
 
-            # (Real-mode safety) If we think we're in a real trade but the exchange is flat, treat as forced close.
-            if self.trade_mode == "real" and str(tr.trade_mode).lower() == "real":
+        # IMPORTANT: EOD decision must run *after* we update state (exits, etc.) for this bar.
+        # Use try/finally so the EOD decision still runs even if the function returns early.
+        try:
+            # Exit/update if in trade
+            if self.open_trade is not None:
+                tr = self.open_trade
+                tr_mode = str(tr.trade_mode).lower()
+
+                # (Real-mode safety) If we think we're in a real trade but the exchange is flat, treat as liquidation/forced close.
+                if str(tr_mode) == "real":
+                    try:
+                        live_sz = float(
+                            self.loop.run_until_complete(
+                                _get_open_position_size_base(
+                                    self.clients,
+                                    address=self.cfg.address,
+                                    subaccount_number=int(self.cfg.subaccount_trading),
+                                    market=self.market,
+                                )
+                            )
+                        )
+                    except Exception:
+                        live_sz = float("nan")
+
+                    dt_entry = pd.to_datetime(tr.entry_time_utc, utc=True, errors="coerce")
+                    age_s = float((t1 - dt_entry).total_seconds()) if pd.notna(dt_entry) else float("inf")
+                    if (np.isfinite(live_sz) and abs(float(live_sz)) <= 0.0) and age_s >= 60.0:
+                        # Treat as liquidation/forced close.
+                        print("unexpected_flat_position: treating as liquidation + clearing open_trade")
+                        self._liquidation_today = True
+                        self._save_trade_mode_state()
+                        self.open_trade = None
+                        return
+
+                tr.mins_in_trade = int(tr.mins_in_trade) + 1
+                k = int(tr.mins_in_trade)
+
+                exit_px = float(bar["close"])
+                cur_ret = float(net_ret_pct_sell(tr.entry_price, exit_px, float(self.fee_side)))
+
+                tr.ret_hist.append(float(cur_ret))
+                tr.peak_ret = float(max(float(tr.peak_ret), float(cur_ret)))
+
+                r_prev1 = float(tr.ret_hist[-2]) if len(tr.ret_hist) >= 2 else float("nan")
+                r_prev2 = float(tr.ret_hist[-3]) if len(tr.ret_hist) >= 3 else float("nan")
+                r_prev3 = float(tr.ret_hist[-4]) if len(tr.ret_hist) >= 4 else float("nan")
+
+                pred_gap = self._exit_gap_pred_at(
+                    i=int(i),
+                    mins_in_trade=int(k),
+                    cur_ret=float(cur_ret),
+                    r_prev1=float(r_prev1),
+                    r_prev2=float(r_prev2),
+                    r_prev3=float(r_prev3),
+                    peak_ret=float(tr.peak_ret),
+                )
+
+                exit_reason = ""
+                if int(k) >= int(self.hold_min):
+                    exit_reason = "hold_min"
+                elif int(k) >= int(self.exit_gap_min_exit_k) and pred_gap is not None and float(pred_gap) <= float(self.exit_gap_tau):
+                    exit_reason = "pred_gap<=tau"
+
+                if not exit_reason:
+                    return
+
+                print(
+                    f"{_iso_utc(t1)} EXIT signal trade_id={tr.trade_id} k={int(k)} reason={exit_reason} cur_ret_1x_pct={float(cur_ret):.3f} pred_gap={(_finite_or_none(pred_gap))}"
+                )
+
+                # Exit now
+                if str(tr_mode) == "paper":
+                    # Update paper equity multiplier (best-effort).
+                    try:
+                        trade_mult = float(net_mult_sell(float(tr.entry_price), float(exit_px), float(self.fee_side)))
+                        self._paper_cum_mult = float(self._paper_cum_mult) * float(trade_mult)
+                        self._save_trade_mode_state()
+                    except Exception:
+                        pass
+
+                    self.trades.append(
+                        {
+                            "trade_id": tr.trade_id,
+                            "trade_mode": "paper",
+                            "symbol": self.market,
+                            "direction": "SHORT",
+                            "entry_time_utc": tr.entry_time_utc,
+                            "exit_time_utc": _iso_utc(t1),
+                            "entry_price": float(tr.entry_price),
+                            "exit_price": float(exit_px),
+                            "exit_rel_min": int(k),
+                            "entry_score": float(tr.entry_score),
+                            "entry_threshold": float(tr.entry_threshold),
+                            "exit_pred_gap_pct": _finite_or_none(pred_gap),
+                            "exit_gap_tau": float(self.exit_gap_tau),
+                            "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
+                            "exit_reason": str(exit_reason),
+                            "realized_ret_1x_pct": float(cur_ret),
+                        }
+                    )
+
+                    try:
+                        self._audit_trade_closed(
+                            paper=True,
+                            entry_time_utc=str(tr.entry_time_utc),
+                            exit_time_utc=_iso_utc(t1),
+                            entry_price=float(tr.entry_price),
+                            exit_price=float(exit_px),
+                            exit_rel_min=int(k),
+                            realized_ret_pct=float(cur_ret),
+                            entry_score=float(tr.entry_score),
+                            entry_threshold=float(tr.entry_threshold),
+                            extra={
+                                "exit_pred_gap_pct": _finite_or_none(pred_gap),
+                                "exit_gap_tau": float(self.exit_gap_tau),
+                                "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
+                                "exit_reason": str(exit_reason),
+                            },
+                        )
+                    except Exception as e:
+                        print("audit_trade_closed_failed:", e)
+
+                    self.open_trade = None
+                    self._flush_trades_csv()
+                    return
+
+                # real mode exit
+                try:
+                    equity_before = float(
+                        self.loop.run_until_complete(
+                            _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=int(self.cfg.subaccount_trading))
+                        )
+                    )
+                except Exception:
+                    equity_before = float("nan")
+
                 try:
                     live_sz = float(
                         self.loop.run_until_complete(
@@ -1426,58 +1987,68 @@ class EthSellSimpleRunner:
                         )
                     )
                 except Exception:
-                    live_sz = float("nan")
+                    live_sz = 0.0
 
-                dt_entry = pd.to_datetime(tr.entry_time_utc, utc=True, errors="coerce")
-                age_s = float((t1 - dt_entry).total_seconds()) if pd.notna(dt_entry) else float("inf")
-                if (np.isfinite(live_sz) and abs(float(live_sz)) <= 0.0) and age_s >= 60.0:
-                    # Clear state; caller can decide whether to recap externally.
-                    print("unexpected_flat_position: clearing open_trade")
-                    self.open_trade = None
-                    return
+                size_to_close = float(abs(live_sz)) if abs(float(live_sz)) > 0.0 else float(tr.size_base)
 
-            tr.mins_in_trade = int(tr.mins_in_trade) + 1
-            k = int(tr.mins_in_trade)
+                close_meta = {}
+                bank_ops = {}
+                try:
+                    close_meta = self.loop.run_until_complete(self._close_real_short(size_base=float(size_to_close)))
+                except Exception as e:
+                    print("close_real_short_failed:", e)
 
-            exit_px = float(bar["close"])
-            cur_ret = float(net_ret_pct_sell(tr.entry_price, exit_px, float(self.fee_side)))
+                try:
+                    if np.isfinite(float(equity_before)):
+                        bank_ops = self.loop.run_until_complete(self._siphon_profit_and_topup(equity_before=float(equity_before)))
+                        if bank_ops:
+                            print(
+                                f"bank_ops completed: siphon={bank_ops.get('siphon',{}).get('transferred_usdc',0):.2f} topup={bank_ops.get('topup',{}).get('transferred_usdc',0):.2f}"
+                            )
+                except Exception as e:
+                    print("bank_ops_failed:", e)
+                    import traceback
 
-            tr.ret_hist.append(float(cur_ret))
-            tr.peak_ret = float(max(float(tr.peak_ret), float(cur_ret)))
+                    traceback.print_exc()
 
-            r_prev1 = float(tr.ret_hist[-2]) if len(tr.ret_hist) >= 2 else float("nan")
-            r_prev2 = float(tr.ret_hist[-3]) if len(tr.ret_hist) >= 3 else float("nan")
-            r_prev3 = float(tr.ret_hist[-4]) if len(tr.ret_hist) >= 4 else float("nan")
+                # Trade-based PnL (B):
+                # - We keep a day-level realized PnL accumulator.
+                # - We also keep an "open unrealized baseline at day start" so trades that span midnight do not leak PnL.
+                #
+                # IMPORTANT:
+                # If a trade spans midnight and then closes, we must fold the day-start unrealized baseline into the
+                # realized accumulator and reset the baseline to 0.0; otherwise, opening a new trade later the same day
+                # would drop the baseline correction and make the day PnL jump.
+                try:
+                    base_before_close = float(self._real_day_open_unrealized_base_usdc)
 
-            pred_gap = self._exit_gap_pred_at(
-                i=int(i),
-                mins_in_trade=int(k),
-                cur_ret=float(cur_ret),
-                r_prev1=float(r_prev1),
-                r_prev2=float(r_prev2),
-                r_prev3=float(r_prev3),
-                peak_ret=float(tr.peak_ret),
-            )
+                    entry_px_fill = float(tr.entry_fill_price or tr.entry_price)
+                    entry_sz_fill = float(tr.entry_fill_size_base or tr.size_base)
+                    exit_px_fill = float((close_meta or {}).get("fill_price") or float(exit_px))
+                    exit_sz_fill = float((close_meta or {}).get("fill_size_base") or float(size_to_close))
+                    fee_exit = float((close_meta or {}).get("fee_usdc") or 0.0)
 
-            exit_reason = ""
-            if int(k) >= int(self.hold_min):
-                exit_reason = "hold_min"
-            elif int(k) >= int(self.exit_gap_min_exit_k) and pred_gap is not None and float(pred_gap) <= float(self.exit_gap_tau):
-                exit_reason = "pred_gap<=tau"
+                    used_sz = float(min(abs(entry_sz_fill), abs(exit_sz_fill)))
+                    pnl_gross = float(used_sz) * float(entry_px_fill - exit_px_fill)
+                    pnl_net = float(pnl_gross) - (float(fee_exit) if np.isfinite(fee_exit) else 0.0)
 
-            if not exit_reason:
-                return
+                    if np.isfinite(pnl_net):
+                        self._real_day_trade_realized_pnl_usdc = float(self._real_day_trade_realized_pnl_usdc) + float(pnl_net)
 
-            print(
-                f"{_iso_utc(t1)} EXIT signal trade_id={tr.trade_id} k={int(k)} reason={exit_reason} cur_ret_1x_pct={float(cur_ret):.3f} pred_gap={(_finite_or_none(pred_gap))}"
-            )
+                    # We're exiting to flat (we clear open_trade below), so reset the unrealized baseline.
+                    # Fold it into realized so day PnL remains consistent if we open another trade later today.
+                    if np.isfinite(base_before_close) and abs(float(base_before_close)) > 0.0:
+                        self._real_day_trade_realized_pnl_usdc = float(self._real_day_trade_realized_pnl_usdc) - float(base_before_close)
+                    self._real_day_open_unrealized_base_usdc = 0.0
 
-            # Exit now
-            if self.trade_mode == "paper":
+                    self._save_trade_mode_state()
+                except Exception:
+                    pass
+
                 self.trades.append(
                     {
                         "trade_id": tr.trade_id,
-                        "trade_mode": "paper",
+                        "trade_mode": "real",
                         "symbol": self.market,
                         "direction": "SHORT",
                         "entry_time_utc": tr.entry_time_utc,
@@ -1491,13 +2062,15 @@ class EthSellSimpleRunner:
                         "exit_gap_tau": float(self.exit_gap_tau),
                         "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
                         "exit_reason": str(exit_reason),
-                        "realized_ret_1x_pct": float(cur_ret),
+                        "realized_ret_1x_pct_assumed_fee": float(cur_ret),
+                        "close": close_meta,
+                        "bank_ops": bank_ops,
                     }
                 )
 
                 try:
                     self._audit_trade_closed(
-                        paper=True,
+                        paper=False,
                         entry_time_utc=str(tr.entry_time_utc),
                         exit_time_utc=_iso_utc(t1),
                         entry_price=float(tr.entry_price),
@@ -1511,6 +2084,8 @@ class EthSellSimpleRunner:
                             "exit_gap_tau": float(self.exit_gap_tau),
                             "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
                             "exit_reason": str(exit_reason),
+                            "close": close_meta,
+                            "bank_ops": bank_ops,
                         },
                     )
                 except Exception as e:
@@ -1520,7 +2095,81 @@ class EthSellSimpleRunner:
                 self._flush_trades_csv()
                 return
 
-            # real mode exit
+            # No open trade: decide entry
+            score = self._entry_score_at(int(i))
+            if score is None or not np.isfinite(float(score)):
+                return
+
+            thr = float(self.entry_threshold)
+            action = "enter" if float(score) >= float(thr) else "hold"
+
+            recent_spike_pct = self._recent_spike_abs_ret_1m_pct(int(i))
+            spike_meta: Dict[str, Any] = {
+                "recent_spike_pct": _finite_or_none(recent_spike_pct),
+                "spike_guard_abs_ret_1m_pct": float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.25)),
+                "spike_guard_lookback_bars": int(getattr(self, "spike_guard_lookback_bars", 5)),
+            }
+
+            # Spike-guard filter
+            if action == "enter":
+                thr_spike = float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.0) or 0.0)
+                if thr_spike > 0.0 and recent_spike_pct is not None and float(recent_spike_pct) > float(thr_spike):
+                    spike_meta["spike_guard_triggered"] = True
+                    spike_meta["spike_guard_reason"] = "recent_spike_gt_threshold"
+                    print(
+                        f"{_iso_utc(t1)} SPIKE_GUARD hold: recent_spike_pct={float(recent_spike_pct):.3f}% > {float(thr_spike):.3f}% (lookback={int(self.spike_guard_lookback_bars)} bars)"
+                    )
+                    action = "hold"
+
+            if int(getattr(self, "log_every", 0) or 0) > 0:
+                if action == "enter" or (int(i) % int(self.log_every) == 0):
+                    rs = spike_meta.get("recent_spike_pct")
+                    rs_s = "None" if rs is None else f"{float(rs):.3f}%"
+                    print(f"{_iso_utc(t1)} entry_decision score={float(score):.6f} thr={float(thr):.6f} action={action} recent_spike={rs_s}")
+
+            try:
+                self._audit_entry_decision(
+                    bar=bar,
+                    score=float(score),
+                    threshold=float(thr),
+                    action=str(action),
+                    i=int(i),
+                    extra=spike_meta,
+                )
+            except Exception as e:
+                print("audit_entry_decision_failed:", e)
+
+            if action != "enter":
+                return
+
+            mode_now = str(self.trade_mode).lower()
+
+            if mode_now == "paper":
+                self._trade_seq += 1
+                tr = OpenTrade(
+                    trade_id=f"paper_{self._trade_seq}",
+                    trade_mode="paper",
+                    entry_time_utc=_iso_utc(t1),
+                    entry_price=float(bar["close"]),
+                    entry_score=float(score),
+                    entry_threshold=float(thr),
+                    size_base=0.0,
+                )
+                self.open_trade = tr
+                print(f"{_iso_utc(t1)} ENTER paper trade_id={tr.trade_id} entry_px={tr.entry_price:.2f}")
+                return
+
+            # real mode entry
+            try:
+                topup_res = self.loop.run_until_complete(self._ensure_trading_floor())
+                if topup_res.get("skipped"):
+                    print(f"pre_entry_topup_skipped: {topup_res.get('skip_reason')} | {topup_res}")
+            except Exception as e:
+                print("pre_entry_topup_failed:", e)
+                import traceback
+
+                traceback.print_exc()
+
             try:
                 equity_before = float(
                     self.loop.run_until_complete(
@@ -1528,197 +2177,48 @@ class EthSellSimpleRunner:
                     )
                 )
             except Exception:
-                equity_before = float("nan")
+                equity_before = 0.0
 
+            entry_meta = {}
             try:
-                live_sz = float(
-                    self.loop.run_until_complete(
-                        _get_open_position_size_base(
-                            self.clients,
-                            address=self.cfg.address,
-                            subaccount_number=int(self.cfg.subaccount_trading),
-                            market=self.market,
-                        )
-                    )
-                )
+                entry_meta = self.loop.run_until_complete(self._open_real_short(equity_before=float(equity_before)))
+            except Exception as e:
+                print("open_real_short_failed:", e)
+                return
+
+            # Trade-based PnL (B): account for entry fee immediately; unrealized baseline for this trade is 0 at entry.
+            try:
+                fee_entry = float(entry_meta.get("fee_usdc") or 0.0)
+                if np.isfinite(fee_entry) and fee_entry > 0.0:
+                    self._real_day_trade_realized_pnl_usdc = float(self._real_day_trade_realized_pnl_usdc) - float(fee_entry)
+                self._real_day_open_unrealized_base_usdc = 0.0
+                self._save_trade_mode_state()
             except Exception:
-                live_sz = 0.0
+                pass
 
-            size_to_close = float(abs(live_sz)) if abs(float(live_sz)) > 0.0 else float(tr.size_base)
+            entry_px = float(entry_meta.get("fill_price") or float(bar["close"]))
+            size_base = float(entry_meta.get("fill_size_base") or 0.0)
+            entry_time_utc = str(entry_meta.get("fill_time_utc") or _iso_utc(t1))
 
-            close_meta = {}
-            bank_ops = {}
-            try:
-                close_meta = self.loop.run_until_complete(self._close_real_short(size_base=float(size_to_close)))
-            except Exception as e:
-                print("close_real_short_failed:", e)
-
-            try:
-                if np.isfinite(float(equity_before)):
-                    bank_ops = self.loop.run_until_complete(self._siphon_profit_and_topup(equity_before=float(equity_before)))
-                    if bank_ops:
-                        print(f"bank_ops completed: siphon={bank_ops.get('siphon',{}).get('transferred_usdc',0):.2f} topup={bank_ops.get('topup',{}).get('transferred_usdc',0):.2f}")
-            except Exception as e:
-                print("bank_ops_failed:", e)
-                import traceback
-                traceback.print_exc()
-
-            self.trades.append(
-                {
-                    "trade_id": tr.trade_id,
-                    "trade_mode": "real",
-                    "symbol": self.market,
-                    "direction": "SHORT",
-                    "entry_time_utc": tr.entry_time_utc,
-                    "exit_time_utc": _iso_utc(t1),
-                    "entry_price": float(tr.entry_price),
-                    "exit_price": float(exit_px),
-                    "exit_rel_min": int(k),
-                    "entry_score": float(tr.entry_score),
-                    "entry_threshold": float(tr.entry_threshold),
-                    "exit_pred_gap_pct": _finite_or_none(pred_gap),
-                    "exit_gap_tau": float(self.exit_gap_tau),
-                    "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
-                    "exit_reason": str(exit_reason),
-                    "realized_ret_1x_pct_assumed_fee": float(cur_ret),
-                    "close": close_meta,
-                    "bank_ops": bank_ops,
-                }
-            )
-
-            try:
-                self._audit_trade_closed(
-                    paper=False,
-                    entry_time_utc=str(tr.entry_time_utc),
-                    exit_time_utc=_iso_utc(t1),
-                    entry_price=float(tr.entry_price),
-                    exit_price=float(exit_px),
-                    exit_rel_min=int(k),
-                    realized_ret_pct=float(cur_ret),
-                    entry_score=float(tr.entry_score),
-                    entry_threshold=float(tr.entry_threshold),
-                    extra={
-                        "exit_pred_gap_pct": _finite_or_none(pred_gap),
-                        "exit_gap_tau": float(self.exit_gap_tau),
-                        "exit_gap_min_exit_k": int(self.exit_gap_min_exit_k),
-                        "exit_reason": str(exit_reason),
-                        "close": close_meta,
-                        "bank_ops": bank_ops,
-                    },
-                )
-            except Exception as e:
-                print("audit_trade_closed_failed:", e)
-
-            self.open_trade = None
-            self._flush_trades_csv()
-            return
-
-        # No open trade: decide entry
-        score = self._entry_score_at(int(i))
-        if score is None or not np.isfinite(float(score)):
-            return
-
-        thr = float(self.entry_threshold)
-        action = "enter" if float(score) >= float(thr) else "hold"
-
-        recent_spike_pct = self._recent_spike_abs_ret_1m_pct(int(i))
-        spike_meta: Dict[str, Any] = {
-            "recent_spike_pct": _finite_or_none(recent_spike_pct),
-            "spike_guard_abs_ret_1m_pct": float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.25)),
-            "spike_guard_lookback_bars": int(getattr(self, "spike_guard_lookback_bars", 5)),
-        }
-
-        # Spike-guard filter
-        if action == "enter":
-            thr_spike = float(getattr(self, "spike_guard_abs_ret_1m_pct", 0.0) or 0.0)
-            if thr_spike > 0.0 and recent_spike_pct is not None and float(recent_spike_pct) > float(thr_spike):
-                spike_meta["spike_guard_triggered"] = True
-                spike_meta["spike_guard_reason"] = "recent_spike_gt_threshold"
-                print(
-                    f"{_iso_utc(t1)} SPIKE_GUARD hold: recent_spike_pct={float(recent_spike_pct):.3f}% > {float(thr_spike):.3f}% (lookback={int(self.spike_guard_lookback_bars)} bars)"
-                )
-                action = "hold"
-
-        if int(getattr(self, "log_every", 0) or 0) > 0:
-            if action == "enter" or (int(i) % int(self.log_every) == 0):
-                rs = spike_meta.get("recent_spike_pct")
-                rs_s = "None" if rs is None else f"{float(rs):.3f}%"
-                print(
-                    f"{_iso_utc(t1)} entry_decision score={float(score):.6f} thr={float(thr):.6f} action={action} recent_spike={rs_s}"
-                )
-
-        try:
-            self._audit_entry_decision(
-                bar=bar,
-                score=float(score),
-                threshold=float(thr),
-                action=str(action),
-                i=int(i),
-                extra=spike_meta,
-            )
-        except Exception as e:
-            print("audit_entry_decision_failed:", e)
-
-        if action != "enter":
-            return
-
-        if self.trade_mode == "paper":
             self._trade_seq += 1
             tr = OpenTrade(
-                trade_id=f"paper_{self._trade_seq}",
-                trade_mode="paper",
-                entry_time_utc=_iso_utc(t1),
-                entry_price=float(bar["close"]),
+                trade_id=f"real_{self._trade_seq}",
+                trade_mode="real",
+                entry_time_utc=str(entry_time_utc),
+                entry_price=float(entry_px),
                 entry_score=float(score),
                 entry_threshold=float(thr),
-                size_base=0.0,
+                size_base=float(size_base),
+                entry_fill_price=float(entry_meta.get("fill_price") or float(entry_px)),
+                entry_fill_size_base=float(entry_meta.get("fill_size_base") or float(size_base)),
             )
             self.open_trade = tr
-            print(f"{_iso_utc(t1)} ENTER paper trade_id={tr.trade_id} entry_px={tr.entry_price:.2f}")
-            return
-
-        # real mode entry
-        try:
-            topup_res = self.loop.run_until_complete(self._ensure_trading_floor())
-            if topup_res.get("skipped"):
-                print(f"pre_entry_topup_skipped: {topup_res.get('skip_reason')} | {topup_res}")
-        except Exception as e:
-            print("pre_entry_topup_failed:", e)
-            import traceback
-            traceback.print_exc()
-
-        try:
-            equity_before = float(
-                self.loop.run_until_complete(
-                    _get_subaccount_equity_usdc(self.clients, address=self.cfg.address, subaccount_number=int(self.cfg.subaccount_trading))
-                )
-            )
-        except Exception:
-            equity_before = 0.0
-
-        entry_meta = {}
-        try:
-            entry_meta = self.loop.run_until_complete(self._open_real_short(equity_before=float(equity_before)))
-        except Exception as e:
-            print("open_real_short_failed:", e)
-            return
-
-        entry_px = float(entry_meta.get("fill_price") or float(bar["close"]))
-        size_base = float(entry_meta.get("fill_size_base") or 0.0)
-        entry_time_utc = str(entry_meta.get("fill_time_utc") or _iso_utc(t1))
-
-        self._trade_seq += 1
-        tr = OpenTrade(
-            trade_id=f"real_{self._trade_seq}",
-            trade_mode="real",
-            entry_time_utc=str(entry_time_utc),
-            entry_price=float(entry_px),
-            entry_score=float(score),
-            entry_threshold=float(thr),
-            size_base=float(size_base),
-        )
-        self.open_trade = tr
-        print(f"{entry_time_utc} ENTER real trade_id={tr.trade_id} entry_px={tr.entry_price:.2f} size_base={tr.size_base:.6f}")
+            print(f"{entry_time_utc} ENTER real trade_id={tr.trade_id} entry_px={tr.entry_price:.2f} size_base={tr.size_base:.6f}")
+        finally:
+            try:
+                self._maybe_decide_tomorrow_mode(bar_close_time_utc=t1.to_pydatetime(), cur_close_px=float(bar["close"]))
+            except Exception:
+                pass
 
 
 def main() -> None:
@@ -1742,7 +2242,7 @@ def main() -> None:
     )
 
     ap.add_argument("--market", default=os.getenv("DYDX_MARKET", "ETH-USD"))
-    ap.add_argument("--trade-mode", choices=["paper", "real"], default="paper")
+    ap.add_argument("--trade-mode", choices=["paper", "real", "auto"], default="paper")
     ap.add_argument("--yes-really", action="store_true")
 
     ap.add_argument("--subaccount-trading", type=int, default=int(os.getenv("DYDX_SUBACCOUNT_TRADING", "3") or 3))
@@ -1765,7 +2265,7 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    if str(args.trade_mode).lower() == "real" and not bool(args.yes_really):
+    if str(args.trade_mode).lower() in {"real", "auto"} and not bool(args.yes_really):
         raise SystemExit("Refusing to place real orders without --yes-really")
 
     cfg = DydxV4Config.from_env()
@@ -1790,6 +2290,7 @@ def main() -> None:
             indexer=IndexerClient(str(cfg.indexer_rest).rstrip("/")),
         )
     else:
+        # real/auto both need a full client (auto may place real orders).
         clients = loop.run_until_complete(connect_v4(cfg))
 
     with AuditLogger.create(audit_path) as audit:
@@ -1825,6 +2326,9 @@ def main() -> None:
             fee_side=float(args.fee_side),
             log_every=int(args.log_every),
         )
+
+        if str(args.trade_mode).lower() in {"real", "auto"}:
+            runner.reconcile_startup()
 
         # Warm backfill for stable rolling features.
         bars = loop.run_until_complete(_warm_backfill(clients, market=str(cfg.market), hours=int(args.backfill_hours)))

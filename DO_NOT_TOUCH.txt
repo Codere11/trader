@@ -77,3 +77,28 @@ TRAINING
 	11.10) Promotion policy: generate candidate signals for (a) the last 4 years and (b) the last 7 calendar days (ending yesterday); compare to the current live pair on the same horizons using identical settings (K_PER_DAY, THR_EXIT, MIN_PROFIT_PCT, leverage); promote only if candidate is not worse on BOTH horizons across primary metrics: total PnL ≥ live, mean daily PnL ≥ live, and max drawdown ≤ live; if either horizon is worse on any primary metric, do not update
 	11.11) Drift checks at retrain: compare feature distributions (KS test) vs prior training; if >10% of features drift (p<0.01), trigger a feature audit and freeze promotion
 	11.12) Reproducibility: fix random seeds, persist TRAIN_END_DATE, hashes of input CSVs, and git commit id; write a training_manifest.json alongside artifacts
+
+ETH-USD SELL (dYdX v4) daily-reset backtest + regime-switching note (UTC): 2026-01-08
+- Backtest run (full): data/backtests/daily_reset_eth_sell_live_like_full_jump_2026-01-08T16-16-21Z_{days,trades,days_with_regimes,corrs,...}
+- Daily reset spec: each UTC day starts at 10 USDC; 50x leverage; 100% margin; trades crossing midnight are discarded.
+- Key full-run stats: 788 days, 5800 trades, 37 discards; good_days=458, bad_days=330; mean daily_ret_50x_pct=+523.31%, median=+25.65%, p05=-90.39%, p95=+2076.04%.
+
+Paper/Real switching policy simulation (computed from day-level results; no re-backtest):
+- Policy: default PAPER. Tomorrow is REAL iff today daily_ret_50x_pct > 0. Otherwise tomorrow is PAPER.
+- Simulation outputs: data/backtests/paper_real_switch_from_full_jump_2026-01-08T16-16-21Z_{summary,schedule}.parquet
+- Counts: real_days=458, paper_days=330 (real_frac=58.1%).
+- Real-day win rate: 82.3%.
+- Break cases (where 1-day rule is wrong):
+  * missed_good_days (PAPER but would have been >0): 81
+  * taken_bad_days (REAL but <=0): 81
+  * wipeout days in full run (daily_ret<=-100%): 10 total; 5 occur on REAL days under the switch policy.
+
+Observed prior-day patterns for rule-breaks (univariate; based on prev_* regime cols + prev day backtest metrics):
+- Missed-good days (paper->today positive): tend to follow a "mild" losing day with fewer trades.
+  * prev_bt_daily_ret_50x_pct: -14.66 vs -42.85 (missed-good vs other PAPER days)
+  * prev_bt_n_trades: 2.15 vs 6.56
+  * prev_day_range_pct: 4.08 vs 4.80; prev_realized_vol_day: 0.067 vs 0.082
+- Taken-bad days (real->today non-positive): tend to follow a quieter/low-activity prior day.
+  * prev_day_range_pct: 5.11 vs 6.41 (taken-bad vs other REAL days)
+  * prev_volume_day: 57.7k vs 71.0k; prev_realized_vol_day: 0.0860 vs 0.1042
+  * prev_bt_daily_ret_50x_pct: 255.8 vs 1070.4; prev_bt_n_trades: 5.77 vs 9.35
